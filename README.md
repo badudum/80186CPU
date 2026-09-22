@@ -1,8 +1,13 @@
 # FPGA80186
 
+> Repository: **[badudum/80186CPU](https://github.com/badudum/80186CPU)** —
+> `git clone git@github.com:badudum/80186CPU.git`
+> (the Quartus project inside is named `FPGA80186`, which is what every
+> `quartus_*` command below refers to.)
+
 An Intel 80186 implemented in SystemVerilog for the **Terasic DE1-SoC**
 (Cyclone V `5CSEMA5F31C6`), with the peripherals the chip integrated on-die and
-enough of a PC/XT-shaped system around it to aim at running MS-DOS.
+enough of a PC/XT-shaped system around it to run MS-DOS.
 
 The CPU is a full 80186 core — BIU/EU split, six-byte prefetch queue,
 segment:offset addressing, the whole instruction set including string
@@ -12,13 +17,27 @@ integrated peripherals (interrupt controller, timers, DMA, chip-select unit,
 peripheral control block) plus the parts a PC needs that the 80186 never had:
 VGA text output, a PS/2 keyboard controller and an SDRAM controller.
 
-**Status:** the machine cold-boots a **BIOS with working INT 10h/13h/16h
-services**, which loads a **FAT12 boot sector**, which reads the BIOS parameter
-block, finds `KERNEL.BIN` in the root directory by name, follows its cluster
-chain, loads it and jumps to it — and the loaded program then **echoes keys
-typed on a PS/2 keyboard**. All in simulation, with nothing stubbed. It
-synthesises, fits, and meets timing at every corner. It has not yet been run on
-hardware.
+**Status: it runs MS-DOS 6.22 on real hardware.** The board cold-boots its own
+**BIOS**, which loads the **MS-DOS boot sector** off a 1.44 MB floppy image in
+SDRAM, which loads `IO.SYS` and `MSDOS.SYS`, which load `COMMAND.COM` — all of
+it Microsoft's code, unmodified, running on this core through this BIOS's
+`INT 10h/13h/16h`:
+
+```
+FPGA80186 BIOS -- 640K, VGA text, PS/2 keyboard, block storage.
+Booting from disk 0...
+Boot sector loaded, starting.
+Starting MS-DOS...
+
+Current date is Tue 01/01/1980
+Enter new date (mm-dd-yy):
+```
+
+Leave `AUTOEXEC.BAT` in place and you get the MS-DOS 6.22 Setup installer
+instead, box-drawing characters and all, waiting at **ENTER=Continue**.
+
+The project's own test system — a BIOS, a FAT12 volume and a `KERNEL.BIN`
+loaded from it by name — still boots too, and is what the regression checks:
 
 ```
 FPGA80186 BIOS -- 640K, VGA text, PS/2 keyboard, block storage.
@@ -30,8 +49,11 @@ KERNEL.BIN loaded from FAT12 and running.
 hello
 ```
 
-The last line is typed. Lines 0–2 come from the ROM; lines 3–4 come from the
-boot sector on the disk; line 5 comes from a *file* on the filesystem.
+The last line is typed on a PS/2 keyboard. Lines 0–2 come from the ROM; lines
+3–4 from the boot sector on the disk; line 5 from a *file* on the filesystem.
+
+It synthesises, fits and meets timing at every corner: 14% of the ALMs, 8% of
+the block RAM, no negative slack.
 
 ---
 
@@ -551,27 +573,29 @@ conflicting pins, ports with no assignment, and the same pin used twice.
 
 ## Known limitations
 
-- **Not yet run on hardware.** Everything above is simulation and static
-  analysis.
-- **Storage is ROM-backed, and small.** The DE1-SoC's microSD socket is wired
-  to the **HPS, not the FPGA fabric** (manual Table 3-28: `HPS_SD_CLK`,
-  `HPS_SD_CMD`, `HPS_SD_DATA[3:0]` on pins A16/F18/G18/C17/D17/B16), so fabric
-  logic cannot reach the card without running software on the ARM or adding a
-  GPIO breakout. The disk is therefore an on-chip ROM image baked into the
-  bitstream, 32 KB by default and read-only. The register interface is the
-  shape of a real block device, so an SD or GPIO backend can replace it without
-  the software above changing.
-- **The BIOS is a useful subset, not a complete one.** `INT 13h` cannot write
-  (the backing store is ROM), there is one video page and one video mode, no
-  `INT 15h`, and extended keys (the `E0` prefix) are consumed but not mapped.
-  Enough to boot and interact; not yet enough for arbitrary DOS software.
-- **The filesystem is read-only.** `fat12.py` can create a volume and add
-  files, and the boot sector can read one, but nothing writes to the disk at
-  runtime — the backing store is ROM, so `INT 13h` has no write function.
-- **No DOS.** `KERNEL.BIN` is a demonstration program, not an operating
-  system. The mechanism it proves is the one DOS needs (a boot sector that
-  finds and loads a named file), so the next step is putting a real kernel
-  image on the volume rather than building more infrastructure.
+- **The disk is volatile.** With `DISK_IN_SDRAM` the image lives in SDRAM and
+  is pushed in over the USB-Blaster after every power-up, so anything DOS
+  writes is lost on reload or power-off. The on-chip ROM backend survives
+  power-up but is read-only and caps out around 700 sectors — far short of a
+  1.44 MB floppy. The DE1-SoC's microSD socket is wired to the **HPS, not the
+  FPGA fabric** (manual Table 3-28: `HPS_SD_CLK`, `HPS_SD_CMD`,
+  `HPS_SD_DATA[3:0]` on pins A16/F18/G18/C17/D17/B16), so fabric logic cannot
+  reach the card without running software on the ARM or adding a GPIO
+  breakout. The register interface is the shape of a real block device, so an
+  SD or GPIO backend can replace it without the software above changing.
+- **The BIOS is a useful subset, not a complete one.** `INT 13h` has no write
+  function, there is one video page and one video mode, no `INT 15h`, and
+  extended keys (the `E0` prefix) are consumed but not mapped. Enough for
+  MS-DOS to boot and for its Setup program to run; not enough for arbitrary
+  DOS software.
+- **The filesystem is read-only in practice.** `fat12.py` can create a volume
+  and add files, and the boot sector can read one, but `INT 13h` has no write
+  function, so nothing changes the disk at runtime.
+- **No PC-compatible peripherals beyond the essentials.** There is no 8259 at
+  20h/21h, no 8253 at 40h-43h and no 8237 at 00h-0Fh — this design uses the
+  80186's own integrated equivalents, at the 80186's own addresses. Port 61h
+  exists only far enough to keep timing-calibration loops running. Software
+  that programs those chips directly will not work.
 - **Text mode only.** No graphics modes; they need more VRAM than fits on-chip.
 - **Font licensing.** `rom/font.hex` is extracted from the cp850-8x16 console
   font in the Linux `kbd` package, which is GPL-2.0. Check that before
@@ -583,9 +607,11 @@ conflicting pins, ports with no assignment, and the same pin used twice.
 
 ### On-chip memory is inferred, not instantiated IP
 
-All nine on-chip memories (boot ROM x2 banks, font ROM, text buffer x4, disk
-image, keyboard FIFO) are written as plain SystemVerilog arrays and left to
-Quartus. That is deliberate, and the synthesis log shows it costs nothing:
+The on-chip memories (boot ROM x2 banks, font ROM, text buffer, keyboard FIFO,
+and the disk image when it is ROM-backed) are written as plain SystemVerilog
+arrays and left to Quartus. `ISMCE=1` is the exception: it instantiates
+`altera_syncram` explicitly, because the in-system memory editor needs a named
+instance to attach to — see **Loading things over JTAG**. That is deliberate, and the synthesis log shows it costs nothing:
 inference produces `altsyncram` megafunctions — the *same* primitive the IP
 catalog would instantiate — and `$readmemh` is converted into `.mif` files that
 are baked into the bitstream (`Parameter INIT_FILE set to
