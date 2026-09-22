@@ -540,12 +540,21 @@ I/O space:
 | Port | Device |
 |---|---|
 | `0060`, `0064` | PS/2 keyboard data and status |
+| `0061` | system control port: bit 4 is the DRAM refresh toggle |
 | `0320`–`032F` | block storage (PC/XT hard-disk range) |
 | `03D4`, `03D5` | 6845 CRTC — cursor position and visibility |
 | `FF00`–`FFFF` | 80186 Peripheral Control Block (relocatable) |
 
 The PCB holds the interrupt controller, timers, DMA channels and chip-select
 registers at their architectural offsets.
+
+Port `0061` is the odd one out: it is not a device, just the two bits PC
+software expects to find there. Bit 4 toggles every 15.085 us as the DRAM
+refresh signal does on a real PC, which is what timing-calibration loops watch,
+and bits 1:0 are the speaker gate and data, which nothing here drives but which
+read back because code that writes them reads first and puts them back. It
+exists because such loops have no timeout — on real hardware the bit cannot
+fail to change — so without it MS-DOS hangs there permanently.
 
 ---
 
