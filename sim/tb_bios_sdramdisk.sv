@@ -1,0 +1,186 @@
+`timescale 1ns/1ns
+//
+// The whole machine booting with the disk in SDRAM instead of on-chip ROM.
+//
+// This is the test that says the backend swap is invisible. The BIOS, the
+// FAT12 boot sector and KERNEL.BIN are byte-for-byte the same as in tb_bios;
+// only DISK_IN_SDRAM changes. If the same seven lines appear on screen, then
+// INT 13h, the boot sector's cluster walking and everything above them cannot
+// tell which backend is underneath -- which is the whole point of putting the
+// swap behind the device's register interface.
+//
+// The SDRAM model is preloaded with the disk image at BASE, which is exactly
+// what the JTAG loader will do on hardware. SDRAM is volatile, so without that
+// step the machine boots to a blank disk.
+//
+// Note the two things sharing the memory here: conventional RAM below 1 MB and
+// the disk image above it, both going through sdram_arbiter to one controller
+// port. That contention is not simulated anywhere else at this scale.
+//
+module tb_bios_sdramdisk;
+
+    localparam int  DISK_SECTORS = 256;
+    localparam int  DISK_BASE    = 24'h100000;
+
+    logic       CLOCK_50 = 0;
+    logic [0:0] KEY = 1'b1;
+    logic [9:0] LEDR;
+    logic [7:0] VGA_R, VGA_G, VGA_B;
+    logic       VGA_HS, VGA_VS, VGA_CLK, VGA_BLANK_N, VGA_SYNC_N;
+    logic       PS2_CLK = 1'b1, PS2_DAT = 1'b1;
+    logic [12:0] DRAM_ADDR;
+    logic [1:0]  DRAM_BA;
+    wire  [15:0] DRAM_DQ;
+    logic        DRAM_CKE, DRAM_CS_N, DRAM_RAS_N, DRAM_CAS_N, DRAM_WE_N;
+    logic        DRAM_LDQM, DRAM_UDQM, DRAM_CLK;
+
+    FPGA80186 #(
+        .DISK_IN_SDRAM      (1'b1),
+        .DISK_SECTORS       (DISK_SECTORS),
+        .ENABLE_JTAG_LOADER (1'b0)
+    ) dut (.*);
+    defparam dut.u_clk_rst.DEBOUNCE = 20;
+    defparam dut.u_mem.SDRAM_INIT_CYCLES = 40;
+
+    sdram_model #(.CAS_LATENCY(2)) chip (
+        .dram_clk (DRAM_CLK), .dram_cke (DRAM_CKE), .dram_cs_n (DRAM_CS_N),
+        .dram_ras_n (DRAM_RAS_N), .dram_cas_n (DRAM_CAS_N), .dram_we_n (DRAM_WE_N),
+        .dram_addr (DRAM_ADDR), .dram_ba (DRAM_BA),
+        .dram_dqm ({DRAM_UDQM, DRAM_LDQM}), .dram_dq (DRAM_DQ)
+    );
+
+    always #10 CLOCK_50 = ~CLOCK_50;
+
+    int errors = 0, checks = 0;
+    task chk(input string nm, input int got, input int exp);
+        checks++;
+        if (got !== exp) begin
+            $display("FAIL %-40s got=%04h exp=%04h", nm, got, exp);
+            errors++;
+        end
+    endtask
+
+    function automatic [7:0] cell_ch(input int n);
+        cell_ch = dut.u_mem.u_vram.ram_lo[n];
+    endfunction
+
+    // Byte address -> index in the model's array; see tb_storage_sdram.
+    function automatic int unsigned midx(input int unsigned byte_addr);
+        midx = (byte_addr >> 1) & 21'h1FFFFF;
+    endfunction
+
+    string want [0:6] = '{
+        "FPGA80186 BIOS -- 640K, VGA text, PS/2 keyboard, block storage.",
+        "Booting from disk 0...",
+        "Boot sector loaded, starting.",
+        "Loading KERNEL.BIN",
+        "Starting kernel.",
+        "KERNEL.BIN loaded from FAT12 and running.",
+        "hello"
+    };
+
+    string got;
+    int i, r;
+
+    logic [15:0] image [0:DISK_SECTORS*256-1];
+
+    // Cycles during which the device was asking SDRAM for something. This is
+    // a level held until the arbiter answers, so it counts clocks rather than
+    // transactions -- around fifteen per word. What matters is that it is not
+    // zero, which is what a build where DISK_IN_SDRAM failed to propagate
+    // would show while every other check still passed.
+    int disk_busy_cycles = 0;
+    always @(posedge dut.clk_cpu) if (dut.disk_mrd) disk_busy_cycles++;
+
+    function automatic string read_line(input int row, input int len);
+        string t = "";
+        for (int c = 0; c < len; c++) t = {t, string'(cell_ch(row * 80 + c))};
+        return t;
+    endfunction
+
+    task ps2_bit(input logic b);
+        begin
+            PS2_DAT = b;
+            repeat (30) @(posedge CLOCK_50);
+            PS2_CLK = 1'b0;
+            repeat (30) @(posedge CLOCK_50);
+            PS2_CLK = 1'b1;
+            repeat (30) @(posedge CLOCK_50);
+        end
+    endtask
+
+    task ps2_key(input [7:0] code);
+        logic p;
+        begin
+            p = ~(^code);
+            ps2_bit(1'b0);
+            for (int k = 0; k < 8; k++) ps2_bit(code[k]);
+            ps2_bit(p);
+            ps2_bit(1'b1);
+            repeat (60) @(posedge CLOCK_50);
+        end
+    endtask
+
+    initial begin
+        // ---- put the disk image in SDRAM, as the loader will ----
+        $readmemh("rom/disk.hex", image);
+        for (i = 0; i < DISK_SECTORS*256; i++)
+            chip.mem[midx(DISK_BASE + i*2)] = image[i];
+
+        repeat (10) @(negedge CLOCK_50);
+        KEY[0] = 1'b0;
+        repeat (100) @(negedge CLOCK_50);
+        KEY[0] = 1'b1;
+
+        i = 0;
+        while (!dut.halted && i < 8000000) begin @(negedge CLOCK_50); i++; end
+        chk("machine reached the keyboard wait", dut.halted, 1'b1);
+
+        ps2_key(8'h33);   // h
+        ps2_key(8'h24);   // e
+        ps2_key(8'h4B);   // l
+        ps2_key(8'h4B);   // l
+        ps2_key(8'h44);   // o
+
+        i = 0;
+        while (i < 400000) begin @(negedge CLOCK_50); i++; end
+
+        $display("");
+        for (r = 0; r <= 6; r++) begin
+            got = read_line(r, want[r].len());
+            $display("  line %0d: \"%s\"", r, got);
+            checks++;
+            if (got != want[r]) begin
+                $display("FAIL line %0d mismatch", r);
+                $display("    expected: \"%s\"", want[r]);
+                errors++;
+            end
+        end
+        $display("");
+
+        chk("boot signature reached 0000:7DFE", chip.mem[midx('h7DFE)], 16'hAA55);
+
+        $display("  the device spent %0d cycles reading SDRAM", disk_busy_cycles);
+        checks++;
+        if (disk_busy_cycles < 256) begin
+            $display("FAIL the disk was not actually read out of SDRAM");
+            errors++;
+        end
+        chk("no SDRAM protocol errors", chip.errors, 0);
+
+        $display("");
+        $display("==================================");
+        $display(" checks: %0d   failures: %0d", checks, errors);
+        $display("==================================");
+        if (errors == 0) $display("ALL TESTS PASSED");
+        $finish;
+    end
+
+    initial begin
+        #200000000;
+        $display("FAIL global timeout (IP=%04h halted=%b)", dut.dbg_ip, dut.halted);
+        $display(" checks: %0d   failures: %0d", checks, errors + 1);
+        $finish;
+    end
+
+endmodule
