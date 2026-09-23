@@ -380,6 +380,65 @@ def build_kernel():
     a.mov(AX, CS)
     a.mov(DS, AX)
 
+    # Sector 20 as CHS, computed from the geometry this image is built for
+    # rather than written as a constant -- gen_disk is built at several
+    # geometries and a hard-coded track would address a different sector in
+    # each, which is exactly the class of bug INT 13h has produced before.
+    W_LBA    = 20
+    W_SEC    = (W_LBA % SPT) + 1
+    W_HEAD   = (W_LBA // SPT) % HEADS
+    W_CYL    = W_LBA // (SPT * HEADS)
+    assert W_CYL < 256 and W_SEC < 64
+    W_CHS_CL = (W_CYL << 8) | W_SEC          # CH = cylinder, CL = sector
+    W_CHS_DX = (W_HEAD << 8) | 0x00          # DH = head, DL = drive 0
+
+    # ---- INT 13h AH=03: write a sector, then read it back ----
+    # The disk was read-only until this existed, and the symptom was not a
+    # missing feature: DOS reported "General failure writing drive A" for
+    # anything that touched the disk -- mkdir, copy, saving a file. So the
+    # test is the round trip, not the return code. A write that reports
+    # success and stores nothing is the failure worth catching.
+    #
+    # Sector 20 is past everything the image uses, so clobbering it is safe.
+    a.mov(AX, 0x0800)                    # buffer at 0800:0000
+    a.mov(ES, AX)
+    a.xor(DI, DI)
+    a.mov(CX, 256)
+    a.mov(AX, 0x5AA5)
+    a.cld()
+    a.label("k_fill")
+    a.stosw()
+    a.inc(AX)                            # each word differs, so a rotated or
+    a.loop("k_fill")                     # duplicated sector cannot pass
+
+    a.mov(AX, 0x0800)
+    a.mov(ES, AX)
+    a.xor(BX, BX)
+    a.mov(AX, 0x0301)                    # AH=03 write, AL=1 sector
+    a.mov(CX, W_CHS_CL)
+    a.mov(DX, W_CHS_DX)
+    a.int_(0x13)
+
+    # Store the status IMMEDIATELY, before anything else runs. Carrying it in
+    # a register across the read-back below only creates another thing that
+    # can be wrong when the value turns out surprising.
+    a.mov(BX, AX)                        # BH = AH (status), BL = AL
+    a.xor(AX, AX)
+    a.mov(DS, AX)
+    a.mov(mem(disp=0x0604), BX)
+    a.mov(AX, CS)
+    a.mov(DS, AX)
+
+    # Read it back into a DIFFERENT buffer, so a read that quietly returns the
+    # caller's own memory cannot pass either.
+    a.mov(AX, 0x0900)
+    a.mov(ES, AX)
+    a.xor(BX, BX)
+    a.mov(AX, 0x0201)                    # AH=02 read, AL=1 sector
+    a.mov(CX, W_CHS_CL)
+    a.mov(DX, W_CHS_DX)
+    a.int_(0x13)
+
     # ---- graphics mode, from a program loaded off the filesystem ----
     # Switching to mode 13h and plotting through the aperture is the whole
     # graphics path end to end: INT 10h sets the mode register, the BIOS

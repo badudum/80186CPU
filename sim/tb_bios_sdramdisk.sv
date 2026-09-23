@@ -79,6 +79,7 @@ module tb_bios_sdramdisk;
         "hello"
     };
 
+    logic [15:0] w604;
     string got;
     int i, r;
 
@@ -142,8 +143,16 @@ module tb_bios_sdramdisk;
         ps2_key(8'h4B);   // l
         ps2_key(8'h44);   // o
 
+        // Long enough for the kernel to finish -- echoing, the disk write and
+        // read-back, and the graphics block after them. 400,000 was enough
+        // when this only had to see the echoed text, and it silently was not
+        // once there was anything to check afterwards: the kernel had not yet
+        // reached the code whose results the checks below read, so they were
+        // reading whatever was in memory beforehand. tb_bios waits the same
+        // 5,000,000 for the same reason.
         i = 0;
-        while (i < 400000) begin @(negedge CLOCK_50); i++; end
+        while (i < 5000000) begin @(negedge CLOCK_50); i++; end
+        chk("machine reached the boot sector's HLT", dut.halted, 1'b1);
 
         $display("");
         for (r = 0; r <= 6; r++) begin
@@ -159,6 +168,41 @@ module tb_bios_sdramdisk;
         $display("");
 
         chk("boot signature reached 0000:7DFE", chip.mem[midx('h7DFE)], 16'hAA55);
+
+        // ---- INT 13h AH=03, the round trip ----
+        // The disk was read-only until AH=03 existed, and the symptom was not
+        // a missing feature -- DOS reported "General failure writing drive A"
+        // for mkdir, copy, or saving anything. This is the case that has to
+        // work: an SDRAM-backed disk, written through the BIOS, read back
+        // through the BIOS, and checked in the memory the device actually
+        // owns.
+        // Read into a local first. Passing chip.mem[midx(...)][7:0] straight
+        // into chk gave a different value from $display of the same
+        // expression in the same statement block -- a part-select of an array
+        // element indexed by a function call, handed to a task argument, is
+        // apparently more than this simulator wants to evaluate. Not worth
+        // chasing when a named local is clearer regardless.
+        w604 = chip.mem[midx('h604)];
+        chk("INT 13h AH=03 reported success", w604[15:8], 8'h00);
+
+        // Read back at 0900:0000, a different segment from the 0800:0000 the
+        // kernel wrote from, so a read that quietly handed back the caller's
+        // own buffer cannot pass. Each word differs from the last, so a
+        // rotated or duplicated sector cannot pass either.
+        chk("written word 0 read back",   chip.mem[midx('h9000)],       16'h5AA5);
+        chk("written word 1 read back",   chip.mem[midx('h9002)],       16'h5AA6);
+        chk("written word 255 read back", chip.mem[midx('h9000 + 510)], 16'h5BA4);
+
+        // ...and it is on the disk itself, not merely in a buffer.
+        chk("word 0 reached the disk image",
+            chip.mem[midx(DISK_BASE + 20*512)], 16'h5AA5);
+        chk("word 255 reached the disk image",
+            chip.mem[midx(DISK_BASE + 20*512 + 510)], 16'h5BA4);
+        // The neighbouring sectors must be exactly as the image left them.
+        chk("the sector before is untouched",
+            chip.mem[midx(DISK_BASE + 19*512)], image[19*256]);
+        chk("the sector after is untouched",
+            chip.mem[midx(DISK_BASE + 21*512)], image[21*256]);
 
         $display("  the device spent %0d cycles reading SDRAM", disk_busy_cycles);
         checks++;

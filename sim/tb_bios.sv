@@ -219,6 +219,18 @@ module tb_bios;
         chk("INT 13h AH=08 last head and drive count",
             chip.mem['h602 >> 1], {8'((GEO_HEADS - 1)), 8'd1});
 
+        // ---- INT 13h AH=03 against a READ-ONLY disk ----
+        // This build backs the disk with ROM, which has nowhere to put a
+        // write. The point is that it fails cleanly and says so: storage.sv
+        // raises ERR rather than pretending, and the BIOS turns that into a
+        // non-zero AH instead of hanging in its BUSY poll. tb_bios_sdramdisk
+        // covers the case where the write is supposed to succeed.
+        checks++;
+        if (chip.mem['h604 >> 1][7:0] === 8'h00) begin
+            $display("FAIL INT 13h AH=03 claimed success on a read-only disk");
+            errors++;
+        end
+
         // ---- graphics mode, set and drawn by the loaded kernel ----
         // Read straight out of the framebuffer and the palette the video
         // controller scans, so this covers INT 10h mode 13h, the A0000

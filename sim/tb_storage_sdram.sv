@@ -162,6 +162,27 @@ module tb_storage_sdram;
         end
     endtask
 
+    // The write sequence software actually uses: set LBA (which anchors the
+    // data index), fill the buffer, then issue the command that flushes it.
+    task wait_idle;
+        logic [15:0] w;
+        begin
+            reg_read(R_CMD, w);
+            while (w[0]) reg_read(R_CMD, w);
+        end
+    endtask
+
+    task write_sector(input [23:0] lba, input [15:0] first);
+        int k;
+        begin
+            reg_write(R_LBA_LO, lba[15:0]);
+            reg_write(R_LBA_HI, {8'h00, lba[23:16]});
+            for (k = 0; k < 256; k++) reg_write(R_DATA, first + k[15:0]);
+            reg_write(R_CMD, 16'h0002);
+            wait_idle();
+        end
+    endtask
+
     logic [15:0] v, st;
     int i, s, mism;
 
@@ -201,6 +222,50 @@ module tb_storage_sdram;
 
         issue(SECTORS - 1, 16'h0001);
         reg_read(R_DATA, v); chk("last sector word 0", v, 16'h3F00);
+
+        // ---- WRITE with no preceding read, which is what software does ----
+        // Every write test here used to begin with a READ of the same sector,
+        // and that read was doing hidden work: it raised DRQ, and DRQ used to
+        // gate buffer writes. So the write path passed its tests while being
+        // impossible to drive from software -- a BIOS with no read in front of
+        // its write could not fill the buffer at all, and DOS reported
+        // "General failure writing drive A". A cold write is the real case.
+        // Make it genuinely cold: drain a sector completely so DRQ drops.
+        // Without this the preceding tests leave a sector on offer and the
+        // write silently rides on THEIR DRQ -- which is exactly the hidden
+        // dependency that let the broken write path pass its tests.
+        issue(24'd10, 16'h0001);
+        for (i = 0; i < 256; i++) reg_read(R_DATA, v);
+        reg_read(R_CMD, st);
+        chk("DRQ is clear before the cold write", st[1], 1'b0);
+
+        write_sector(24'd11, 16'hA700);
+        reg_read(R_CMD, st);
+        chk("cold write completed without error", st[2], 1'b0);
+        chk("cold write word 0 reached SDRAM",
+            chip.mem[midx(BASE + 11*512)], 16'hA700);
+        chk("cold write word 1 reached SDRAM",
+            chip.mem[midx(BASE + 11*512 + 2)], 16'hA701);
+        chk("cold write word 255 reached SDRAM",
+            chip.mem[midx(BASE + 11*512 + 510)], 16'hA7FF);
+
+        // And it must read back through the normal path.
+        issue(24'd11, 16'h0001);
+        reg_read(R_DATA, v); chk("cold write reads back word 0", v, 16'hA700);
+        reg_read(R_DATA, v); chk("cold write reads back word 1", v, 16'hA701);
+
+        // ---- the data index is anchored by LBA_LO ----
+        // A read that software abandons half way leaves the index mid-sector.
+        // If a following write filled from there the sector would be written
+        // rotated -- correct bytes, wrong order, no error anywhere.
+        issue(24'd12, 16'h0001);
+        reg_read(R_DATA, v);            // consume only two words, then walk away
+        reg_read(R_DATA, v);
+        write_sector(24'd13, 16'hB500);
+        chk("after an abandoned read, word 0 is still word 0",
+            chip.mem[midx(BASE + 13*512)], 16'hB500);
+        chk("...and word 255 is still word 255",
+            chip.mem[midx(BASE + 13*512 + 510)], 16'hB5FF);
 
         // ---- WRITE: read, modify, write back ----
         issue(24'd7, 16'h0001);

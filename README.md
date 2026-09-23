@@ -243,6 +243,46 @@ device strobe fires only in a cycle where `ready` is high.
 
 ---
 
+## Writing to the disk
+
+The disk was read-only for a long time, and the symptom was not "writes are
+unsupported". DOS reported **General failure writing drive A** for `mkdir`,
+`copy`, or saving a file — while every read worked perfectly, so the machine
+looked healthy right up until something tried to write.
+
+Two things were missing, and the second was the interesting one.
+
+**`INT 13h` had no `AH=03`.** It implemented reset, read and get-parameters,
+and everything else fell through to a catch-all that returns *invalid
+function* with carry set. That much was expected.
+
+**The hardware could not be driven to write either**, which was not expected —
+`storage.sv` has had a `CMD_WRITE` and a working transfer engine all along.
+The block was `DRQ`. It means *a sector is on offer to be read*, it is raised
+only when a read completes, and it was also gating writes **into** the sector
+buffer. So software could never fill the buffer, and `CMD=2` was unreachable.
+
+The write path nevertheless passed its own testbench, because every write test
+there began by *reading* the same sector first — which raised `DRQ` as a side
+effect. The test was accidentally supplying the one precondition that real
+software could not. `sim/tb_storage_sdram.sv` now drains a sector to force
+`DRQ` low, asserts that it is low, and only then does a cold write.
+
+A second trap sat behind that one: the buffer index is only self-clearing at
+the *end* of a transfer, so after a read that software abandoned part-way it
+sits mid-sector. Filling from there would have written a correct sector
+**rotated** by however many words were left — right bytes, wrong order, no
+error anywhere. Writing `LBA_LO` now anchors the index, since setting the LBA
+is the one thing every access does first.
+
+The resulting protocol is **LBA, then data, then command** — the reverse of a
+read, because the command is what copies the buffer out. `write_sector` in the
+BIOS borrows `DS` to point at the caller's `ES:DI` for the `LODSW` loop, so
+nothing between the two may touch the BIOS data area.
+
+Writes land in SDRAM, so they survive a warm reset but not a power cycle, and
+there is currently no way to read a modified image back off the board.
+
 ## The keyboard, and why translation had to be in hardware
 
 PS/2 keyboards power up sending **scancode set 2**. PC software expects **set
@@ -363,7 +403,7 @@ are covered by `tools/test_asm86.py`.
 | Service | Functions |
 |---|---|
 | `INT 10h` | 00 set mode, 02/03 cursor, 06 scroll, 09 write char, 0E teletype, 0F get mode |
-| `INT 13h` | 00 reset, 02 read sectors (CHS→LBA), 08 get parameters |
+| `INT 13h` | 00 reset, 02 read sectors (CHS→LBA), 03 write sectors, 08 get parameters |
 | `INT 16h` | 00 read key (blocking), 01 peek, 02 shift state |
 | `INT 11h` / `INT 12h` | equipment word, memory size |
 | `INT 1Ah` | 00 read tick count |

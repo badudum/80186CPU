@@ -972,6 +972,11 @@ a.jnz("i13_not_read")
 a.jmp("i13_read")
 
 a.label("i13_not_read")
+a.cmp(AH, 0x03)
+a.jnz("i13_not_write")
+a.jmp("i13_write")
+
+a.label("i13_not_write")
 a.cmp(AH, 0x08)
 a.jnz("i13_not_params")
 # Geometry in the shape INT 13h reports it: CH = last cylinder, CL bits 5:0 =
@@ -1019,6 +1024,69 @@ a.mov(mem(BP, disp=8), BX)
 a.pop(BX)
 a.pop(BP)
 a.iret()
+
+# ---- AH=03: write AL sectors from ES:BX to CHS ----
+# The CHS-to-LBA arithmetic is identical to AH=02's, including taking the head
+# out of DH before any MUL runs -- see the note there, that ordering was a real
+# bug and it would be the same bug here.
+a.label("i13_write")
+a.push(DI)
+a.push(SI)
+a.push(CX)
+a.push(DX)
+a.push(BX)
+
+a.push(AX)
+a.mov(BL, DH)                     # head, captured before MUL can clobber DX
+a.mov(BH, 0)
+a.mov(DI, BX)
+a.mov(AL, CH)
+a.mov(AH, 0)
+a.mov(BX, HEADS)
+a.mul(BX)
+a.add(AX, DI)
+a.mov(BX, SPT)
+a.mul(BX)
+a.mov(BL, CL)
+a.and_(BL, 0x3F)
+a.mov(BH, 0)
+a.sub(BX, 1)
+a.add(AX, BX)
+a.mov(SI, AX)                     # SI = LBA
+a.pop(AX)
+
+a.mov(CL, AL)                     # CL = sectors still to write
+a.mov(CH, 0)
+a.pop(BX)
+a.push(BX)
+a.mov(DI, BX)                     # ES:DI = source
+
+a.label("i13_wnext")
+a.cmp(CL, 0)
+a.jz("i13_write_done")
+a.call("write_sector")
+a.jc("i13_write_err")
+a.inc(SI)
+a.dec(CL)
+a.jmps("i13_wnext")
+
+a.label("i13_write_done")
+a.pop(BX)
+a.pop(DX)
+a.pop(CX)
+a.pop(SI)
+a.pop(DI)
+a.mov(AH, 0x00)
+a.jmp("i13_ok")
+
+a.label("i13_write_err")
+a.pop(BX)
+a.pop(DX)
+a.pop(CX)
+a.pop(SI)
+a.pop(DI)
+a.mov(AH, 0x03)                   # write protected / write fault
+a.jmp("i13_fail")
 
 # ---- AH=02: read AL sectors from CHS into ES:BX ----
 a.label("i13_read")
@@ -1128,6 +1196,70 @@ a.jmps("rs_out")
 a.label("rs_fail")
 a.stc()
 a.label("rs_out")
+a.pop(DX)
+a.pop(CX)
+a.pop(AX)
+a.ret()
+
+# ---------------------------------------------------------------------------
+# write_sector -- SI = LBA, ES:DI = source. Advances DI, CF set on error.
+#
+# THE ORDER IS THE OPPOSITE OF A READ and it is not interchangeable: the LBA
+# goes first, then the 256 words, then the command. The command is what copies
+# the buffer out to memory, so data written after it would go nowhere; and
+# writing the LBA is what resets the device's data index, so filling the
+# buffer before setting the LBA would start part-way through the sector and
+# store it rotated. See the header of modules/storage.sv.
+#
+# DS IS BORROWED FOR THE COPY. The source is ES:DI, and LODSW reads DS:SI, so
+# DS is pointed at ES for the duration. Nothing between the two may touch a
+# variable in the BIOS data area -- the segment is wrong until DS is restored.
+# ---------------------------------------------------------------------------
+a.label("write_sector")
+a.push(AX)
+a.push(CX)
+a.push(DX)
+a.push(SI)
+a.push(DS)
+
+a.mov(DX, P_STOR_LBALO)
+a.mov(AX, SI)
+a.out_dx(AX)
+a.mov(DX, P_STOR_LBAHI)
+a.mov(AX, 0)
+a.out_dx(AX)
+
+a.mov(AX, ES)
+a.mov(DS, AX)                     # DS:SI = ES:DI for the duration
+a.mov(SI, DI)
+a.mov(CX, 256)
+a.mov(DX, P_STOR_DATA)
+a.cld()
+a.label("ws_xfer")
+a.lodsw()
+a.out_dx(AX)
+a.loop("ws_xfer")
+a.mov(DI, SI)                     # leave DI past the sector, as STOSW would
+a.pop(DS)
+
+a.mov(DX, P_STOR_CMD)
+a.mov(AX, 2)
+a.out_dx(AX)
+
+a.label("ws_wait")
+a.mov(DX, P_STOR_CMD)
+a.in_dx(AX)
+a.test(AL, 0x01)                  # BUSY
+a.jnz("ws_wait")
+a.test(AL, 0x04)                  # ERR
+a.jnz("ws_fail")
+
+a.clc()
+a.jmps("ws_out")
+a.label("ws_fail")
+a.stc()
+a.label("ws_out")
+a.pop(SI)
 a.pop(DX)
 a.pop(CX)
 a.pop(AX)

@@ -40,9 +40,24 @@
 //         r   STATUS    bit0 BUSY, bit1 DRQ, bit2 ERR
 //   0328  r   SECTORS   size of the device, in sectors
 //
-// USAGE: write LBA, write CMD, poll STATUS until BUSY clears, then read (or
-// write) 256 words at DATA. For a write, fill the buffer through DATA first
-// and then issue CMD=2.
+// USAGE (read):  write LBA, write CMD=1, poll STATUS until BUSY clears, then
+//                read 256 words at DATA.
+// USAGE (write): write LBA, write 256 words at DATA, write CMD=2, then poll
+//                STATUS until BUSY clears. The data goes in BEFORE the
+//                command, because the command is what copies the buffer out.
+//
+// WRITING LBA_LO ALSO RESETS THE DATA INDEX, and a write depends on it. The
+// index is only self-clearing at the END of a transfer, so after a read that
+// software did not drain completely it sits mid-sector; filling the buffer
+// from there would write a correct sector rotated by however many words were
+// left, which is far worse than an error. Setting LBA is the one thing every
+// access does first, so that is where the index is anchored.
+//
+// DRQ MEANS "A SECTOR IS ON OFFER TO BE READ", and it gates reads only. It is
+// raised when a read completes and nothing else ever sets it, so gating buffer
+// WRITES on it made filling the buffer impossible and CMD=2 unreachable: the
+// write path existed, was exercised by its own testbench through the backdoor
+// of a preceding read, and could not be driven by software at all.
 // ---------------------------------------------------------------------------
 
 `timescale 1ns/1ns
@@ -181,7 +196,11 @@ module storage #(
 
     // ---- port A: the CPU side ----
     logic bufa_we;
-    assign bufa_we = sel && wr && !busy && (reg_sel == R_DATA) && drq;
+    // No `drq` here: see the header. DRQ says a sector is available to READ,
+    // which has nothing to do with whether software may fill the buffer.
+    // `!busy` is the guard that matters -- it keeps the CPU out of the buffer
+    // while the transfer engine owns it.
+    assign bufa_we = sel && wr && !busy && (reg_sel == R_DATA);
 
     // Plain `always`, not `always_ff`: an M10K's two ports are written from
     // two separate blocks, and always_ff forbids a second driver.
@@ -207,7 +226,10 @@ module storage #(
     // A DATA access only advances the index while data is actually on offer.
     // Reading past the end of a sector must not walk into the next one.
     logic data_taken;
-    assign data_taken = sel && (rd || wr) && (reg_sel == R_DATA) && drq && !busy;
+    // A read only advances when there is something to read; a write always
+    // advances, because filling the buffer is how a sector is staged.
+    assign data_taken = sel && (rd || wr) && (reg_sel == R_DATA) && !busy
+                        && (wr || drq);
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -273,7 +295,10 @@ module storage #(
             // ---------------- register writes ----------------
             if (sel && wr && !busy) begin
                 case (reg_sel)
-                    R_LBA_LO: lba_set[15:0]  <= wdata;
+                    R_LBA_LO: begin
+                        lba_set[15:0] <= wdata;
+                        windex        <= 8'd0;   // see the header
+                    end
                     R_LBA_HI: lba_set[23:16] <= wdata[7:0];
                     R_CMD: begin
                         if ((wdata == CMD_READ) ||
