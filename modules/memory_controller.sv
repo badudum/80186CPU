@@ -60,6 +60,17 @@ module memory_controller #(
     input  logic [14:0] fb_read_addr,
     output logic [15:0] fb_read_data,
 
+    // The blitter shares the CPU side of the framebuffer. The CPU wins any
+    // cycle it wants the aperture, which is why blit_stall exists: a program
+    // that has started a blit is polling the busy bit rather than writing
+    // pixels, but that is a habit, not a guarantee.
+    input  logic [14:0] blit_addr,
+    input  logic [15:0] blit_wdata,
+    input  logic [1:0]  blit_be,
+    input  logic        blit_we,
+    output logic [15:0] blit_rdata,
+    output logic        blit_stall,
+
     // ---- extra SDRAM requesters ----
     // The block device and the JTAG loader also need the memory. They live
     // outside this module, so their ports are brought out here rather than
@@ -240,12 +251,17 @@ module memory_controller #(
 
     // ---- graphics framebuffer ----
     logic [15:0] fb_q;
+    logic        fb_cpu_access;
+    assign fb_cpu_access = (rd || wr) && in_fb;
+    assign blit_stall    = fb_cpu_access;
+    assign blit_rdata    = fb_q;
+
     framebuffer #(.AW(15)) u_fb (
         .clk_cpu   (clk),
-        .cpu_addr  (addr[15:1]),
-        .cpu_wdata (wdata),
-        .cpu_we    (wr && in_fb),
-        .cpu_be    (be),
+        .cpu_addr  (fb_cpu_access ? addr[15:1]    : blit_addr),
+        .cpu_wdata (fb_cpu_access ? wdata         : blit_wdata),
+        .cpu_we    (fb_cpu_access ? (wr && in_fb) : blit_we),
+        .cpu_be    (fb_cpu_access ? be            : blit_be),
         .cpu_rdata (fb_q),
         .clk_vga   (clk_vga),
         .vga_addr  (fb_read_addr),

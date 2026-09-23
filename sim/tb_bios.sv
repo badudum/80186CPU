@@ -217,6 +217,26 @@ module tb_bios;
         // bar index -- which also proves the row-replicating REP MOVSW ran.
         chk("colour bars replicated down the screen",
             dut.u_mem.u_fb.ram_lo[(320 + 50) >> 1], 8'd3);
+        // ---- the blitter, driven by the loaded kernel ----
+        // Read straight out of the framebuffer the video controller scans, so
+        // this covers the 0330 port decode, the register file, the shared
+        // framebuffer port and the byte lanes from software down.
+        chk("blitter filled the first pixel of its rectangle",
+            dut.u_mem.u_fb.ram_hi[(100*320 + 1) >> 1], 8'h2A);
+        chk("blitter filled the last pixel of the last row",
+            dut.u_mem.u_fb.ram_lo[(100*320 + 1 + 7*320 + 15) >> 1], 8'h2A);
+        chk("blitter left the pixel before the rectangle alone",
+            dut.u_mem.u_fb.ram_lo[(100*320) >> 1], 8'd0);
+        // The kernel's own verdict, which is what the hardware check reads
+        // back over JTAG since the framebuffer is on-chip and invisible to it.
+        chk("the kernel's own blitter self-check passed",
+            chip.mem['h604 >> 1][7:0], 8'hA0);   // 604 is even: low lane
+
+        chk("blitter copied the rectangle elsewhere",
+            dut.u_mem.u_fb.ram_lo[(120*320 + 2) >> 1], 8'h2A);
+        chk("the copy's last row arrived too",
+            dut.u_mem.u_fb.ram_hi[(120*320 + 2 + 7*320 + 15) >> 1], 8'h2A);
+
         chk("palette entry 1 loaded through 3C8/3C9",
             dut.u_dac.pal[1], 18'({6'd63, 6'd0, 6'd0}));
 

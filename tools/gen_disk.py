@@ -443,6 +443,71 @@ def build_kernel():
     a.mov(AX, CS)
     a.mov(DS, AX)
 
+    # ---- drive the blitter from software ----
+    # Ports 0330-033F. This is the whole accelerator path end to end: the I/O
+    # decode, the register file, the shared framebuffer port and the byte
+    # lanes, exercised the way a program would rather than from a testbench.
+    # The rectangle is at an ODD x so the low byte lane is used, and it is
+    # drawn over the colour bars so a wrong address shows up as a stripe in
+    # the wrong place rather than as nothing at all.
+    def blit_reg(port, value):
+        a.mov(DX, port)
+        a.mov(AX, value)
+        a.out_dx(AX)
+
+    blit_reg(0x0330, 100 * 320 + 1)      # DST: row 100, x = 1
+    blit_reg(0x0334, 16)                 # WIDTH
+    blit_reg(0x0336, 8)                  # HEIGHT
+    blit_reg(0x0338, 320)                # DSTSTEP
+    blit_reg(0x033C, 0x002A)             # COLOUR
+    blit_reg(0x033E, 0x0001)             # start, operation 0 = fill
+
+    a.mov(DX, 0x033E)
+    a.label("k_blitwait")
+    a.in_dx(AX)
+    a.test(AX, 1)
+    a.jnz("k_blitwait")
+
+    # ...then copy that rectangle somewhere else, which exercises the read
+    # side and a source stride that differs from the destination stride.
+    blit_reg(0x0332, 100 * 320 + 1)      # SRC: what was just filled
+    blit_reg(0x0330, 120 * 320 + 2)      # DST: an even x this time
+    blit_reg(0x033A, 320)                # SRCSTEP
+    blit_reg(0x033E, 0x0003)             # start, operation 1 = copy
+
+    a.mov(DX, 0x033E)
+    a.label("k_blitwait2")
+    a.in_dx(AX)
+    a.test(AX, 1)
+    a.jnz("k_blitwait2")
+
+    # ...then check its own work and leave the verdict at 0000:0604, where it
+    # can be read back over JTAG. The framebuffer is on-chip and so invisible
+    # to jtag_peek; without this, confirming the blitter on real hardware
+    # needs somebody looking at a monitor.
+    a.mov(AX, 0xA000)
+    a.mov(DS, AX)
+    a.mov(BL, 0)
+
+    for off, want in ((100 * 320 + 1,            0x2A),   # first pixel filled
+                      (100 * 320 + 1 + 7 * 320 + 15, 0x2A),  # last of last row
+                      (120 * 320 + 2,            0x2A),   # the copy landed
+                      (100 * 320,                0x00)):  # and did not spill
+        a.mov(SI, off)
+        a.lodsb()
+        a.cmp(AL, want)
+        a.jz("k_bv%d" % off)
+        a.inc(BL)
+        a.label("k_bv%d" % off)
+
+    a.xor(AX, AX)
+    a.mov(DS, AX)
+    a.mov(AL, BL)
+    a.add(AL, 0xA0)                      # A0 means every check passed
+    a.mov(mem(disp=0x0604), AL)
+    a.mov(AX, CS)
+    a.mov(DS, AX)
+
     # ...and one palette entry, the way software loads a palette: the index to
     # 3C8, then red, green and blue to 3C9.
     a.mov(DX, 0x03C8)

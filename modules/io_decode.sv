@@ -85,6 +85,14 @@ module io_decode #(
     // Video mode, CGA-style: bit 1 selects graphics
     output logic        mode_gfx,
 
+    // blitter
+    output logic        blit_sel,
+    output logic [2:0]  blit_reg,     // (port - 0330h) >> 1
+    output logic        blit_rd,
+    output logic        blit_wr,
+    output logic [15:0] blit_wdata,
+    input  logic [15:0] blit_rdata,
+
     // block storage
     output logic        stor_sel,
     output logic [2:0]  stor_reg,     // (port - 0320h) >> 1
@@ -103,6 +111,8 @@ module io_decode #(
 
     // Block storage occupies 0320-032F, the PC/XT hard-disk controller range.
     localparam logic [11:0] PORT_STOR_PAGE = 12'h032;
+    // The blitter sits at 0330-033F, next to the block device.
+    localparam logic [11:0] PORT_BLIT_PAGE = 12'h033;
 
     // BYTE LANES. A byte-wide device on a 16-bit bus has to answer on the lane
     // the CPU is listening to. The BIU puts an odd-address byte on D15-D8 and
@@ -162,12 +172,15 @@ module io_decode #(
     assign hit_dac  = (io_addr == PORT_DAC_IDX) || (io_addr == PORT_DAC_DATA);
     assign dac_port = (io_addr == PORT_DAC_DATA);
 
-    logic hit_kbd, hit_stor, hit_crtc;
+    logic hit_kbd, hit_stor, hit_crtc, hit_blit;
     assign hit_kbd  = (io_addr == PORT_KBD_DATA) || (io_addr == PORT_KBD_STAT);
     assign kbd_port = (io_addr == PORT_KBD_STAT);
 
     assign hit_stor = (io_addr[15:4] == PORT_STOR_PAGE);
     assign stor_reg = io_addr[3:1];
+
+    assign hit_blit = (io_addr[15:4] == PORT_BLIT_PAGE);
+    assign blit_reg = io_addr[3:1];
 
     // 6845 CRTC, the PC's cursor controller: 3D4 index, 3D5 data.
     assign hit_crtc  = (io_addr == 16'h03D4) || (io_addr == 16'h03D5);
@@ -206,6 +219,11 @@ module io_decode #(
         else if (hit_mode && io_wr && access_strobe) mode_gfx <= byte_wdata[1];
     end
 
+    assign blit_sel   = hit_blit;
+    assign blit_rd    = hit_blit && io_rd && access_strobe;
+    assign blit_wr    = hit_blit && io_wr && access_strobe;
+    assign blit_wdata = wdata;
+
     assign stor_sel   = hit_stor;
     assign stor_rd    = hit_stor && io_rd && access_strobe;
     assign stor_wr    = hit_stor && io_wr && access_strobe;
@@ -227,6 +245,8 @@ module io_decode #(
             rdata = io_addr[0] ? {ppi_rdata, 8'h00} : {8'h00, ppi_rdata};
         else if (hit_stor)
             rdata = stor_rdata;
+        else if (hit_blit)
+            rdata = blit_rdata;
         else
             rdata = 16'hFFFF;
     end

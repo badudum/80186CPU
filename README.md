@@ -111,7 +111,7 @@ configuration and writes nothing into the working tree.
 ./sim/run.sh tb_alu       # a single module
 ```
 
-There are **26 testbenches totalling 757 checks**, all passing, plus 71
+There are **27 testbenches totalling 776 checks**, all passing, plus 71
 assembler encoding tests, 38 filesystem tests and 15 disk-builder tests
 (`python3 tools/test_asm86.py`, `tools/test_fat12.py`, `tools/test_mkdisk.py`):
 
@@ -423,6 +423,37 @@ afternoon here, with the board booting far enough to print six lines and then
 quietly not switching video mode, because the ROM in the bitstream predated the
 mode-13h code. `tools/gen_bios.py` now writes both files together, so they
 cannot get out of step.
+
+## The blitter
+
+`modules/blitter.sv` fills and copies rectangles in the framebuffer without the
+CPU touching a pixel. Three operations — fill, copy, and copy skipping a
+transparent key — through eight registers at I/O `0330`–`033F`, with a busy bit
+to poll. **Fill runs at one clock per pixel and copy at two**, against a CPU
+that needs roughly eight, and it costs 190 ALMs.
+
+It is deliberately not a GPU: nothing is programmable. That is what the era's
+hardware did and it is what 2D inner loops actually need — clearing a screen,
+drawing a sprite, scrolling a window are all a fill or a copy.
+
+**It shares the CPU's framebuffer port and the CPU always wins.** The block RAM
+has two ports and both were already taken (CPU on one, video scan-out on the
+other), so `memory_controller` hands the port to the CPU for any cycle it wants
+the aperture and `stall` holds the blitter still. In practice a program that
+has started a blit is polling the busy bit rather than writing pixels — but
+that is a habit, not a guarantee.
+
+Strides are separate from width on purpose: copying a 32×32 sprite out of a
+320-wide screen needs width 32 with both steps 320, while a sprite packed in
+its own bitmap needs a source step of 32. One number cannot express both, and
+getting it wrong shears the image diagonally.
+
+`tb_blitter` runs against the real `framebuffer`, uses odd offsets so the byte
+lanes have to be right, and models the shared port the way `memory_controller`
+wires it — the CPU genuinely takes the port during a stall. That last part
+matters: with the blitter still connected during a stall, a blitter that
+ignored arbitration writes the same pixel twice to the same address and no test
+notices.
 
 ## The SDRAM controller keeps the row open
 

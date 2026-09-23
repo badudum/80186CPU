@@ -27,6 +27,7 @@
 //   +- keyboard_controller   PS/2 receiver
 //   +- vga_controller    640x480 text mode, or 320x200x8 graphics
 //   +- vga_dac           the 256-colour palette behind mode 13h
+//   +- blitter           rectangle fill and copy in the framebuffer
 //      +- font_rom       8x16 glyphs
 //
 // BUS ROUTING: the CPU's memory and I/O address spaces are separate and
@@ -125,6 +126,13 @@ module FPGA80186 #(
     logic [15:0] fb_read_data;
     logic [7:0]  pal_index;
     logic [17:0] pal_rgb;
+
+    // ---- blitter ----
+    logic        blit_sel, blit_rd, blit_wr, blit_we, blit_stall, blit_busy;
+    logic [2:0]  blit_reg;
+    logic [15:0] blit_wdata, blit_rdata, blit_fb_wdata, blit_fb_rdata;
+    logic [14:0] blit_fb_addr;
+    logic [1:0]  blit_fb_be;
     logic [7:0]  dbg_int_type;
 
     logic        kbd_irq;
@@ -260,6 +268,12 @@ module FPGA80186 #(
         .vram_read_data (vram_data),
         .fb_read_addr   (fb_read_addr),
         .fb_read_data   (fb_read_data),
+        .blit_addr      (blit_fb_addr),
+        .blit_wdata     (blit_fb_wdata),
+        .blit_be        (blit_fb_be),
+        .blit_we        (blit_we),
+        .blit_rdata     (blit_fb_rdata),
+        .blit_stall     (blit_stall),
         .ext_rd         (ext_rd),
         .ext_wr         (ext_wr),
         .ext_addr       (ext_addr),
@@ -291,6 +305,24 @@ module FPGA80186 #(
     logic        stor_sel, stor_rd, stor_wr;
     logic [2:0]  stor_reg;
     logic [15:0] stor_wdata, stor_rdata;
+
+    blitter u_blit (
+        .clk       (clk_cpu),
+        .rst_n     (rst_n),
+        .reg_sel   (blit_sel),
+        .reg_num   (blit_reg),
+        .reg_rd    (blit_rd),
+        .reg_wr    (blit_wr),
+        .reg_wdata (blit_wdata),
+        .reg_rdata (blit_rdata),
+        .stall     (blit_stall),
+        .fb_addr   (blit_fb_addr),
+        .fb_wdata  (blit_fb_wdata),
+        .fb_be     (blit_fb_be),
+        .fb_we     (blit_we),
+        .fb_rdata  (blit_fb_rdata),
+        .busy      (blit_busy)
+    );
 
     vga_dac u_dac (
         .clk_cpu   (clk_cpu),
@@ -330,6 +362,12 @@ module FPGA80186 #(
         .dac_wdata  (dac_wdata),
         .dac_rdata  (dac_rdata),
         .mode_gfx   (mode_gfx),
+        .blit_sel   (blit_sel),
+        .blit_reg   (blit_reg),
+        .blit_rd    (blit_rd),
+        .blit_wr    (blit_wr),
+        .blit_wdata (blit_wdata),
+        .blit_rdata (blit_rdata),
         .stor_sel   (stor_sel),
         .stor_reg   (stor_reg),
         .stor_rd    (stor_rd),
