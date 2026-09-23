@@ -25,7 +25,8 @@
 //   |  +- vram           dual-port text buffer at B8000
 //   +- io_decode         I/O port map -> keyboard, storage
 //   +- keyboard_controller   PS/2 receiver
-//   +- vga_controller    640x480 text mode
+//   +- vga_controller    640x480 text mode, or 320x200x8 graphics
+//   +- vga_dac           the 256-colour palette behind mode 13h
 //      +- font_rom       8x16 glyphs
 //
 // BUS ROUTING: the CPU's memory and I/O address spaces are separate and
@@ -116,6 +117,14 @@ module FPGA80186 #(
 
     logic        halted, dbg_int_taken;
     logic [15:0] dbg_ip, dbg_cs, dbg_flags;
+
+    // ---- graphics: framebuffer scan-out and the palette DAC ----
+    logic        dac_wr, dac_port, mode_gfx;
+    logic [7:0]  dac_wdata, dac_rdata;
+    logic [14:0] fb_read_addr;
+    logic [15:0] fb_read_data;
+    logic [7:0]  pal_index;
+    logic [17:0] pal_rgb;
     logic [7:0]  dbg_int_type;
 
     logic        kbd_irq;
@@ -249,6 +258,8 @@ module FPGA80186 #(
         .clk_vga        (clk_vga),
         .vram_read_addr (vram_addr),
         .vram_read_data (vram_data),
+        .fb_read_addr   (fb_read_addr),
+        .fb_read_data   (fb_read_data),
         .ext_rd         (ext_rd),
         .ext_wr         (ext_wr),
         .ext_addr       (ext_addr),
@@ -281,6 +292,18 @@ module FPGA80186 #(
     logic [2:0]  stor_reg;
     logic [15:0] stor_wdata, stor_rdata;
 
+    vga_dac u_dac (
+        .clk_cpu   (clk_cpu),
+        .rst_n     (rst_n),
+        .dac_wr    (dac_wr),
+        .dac_port  (dac_port),
+        .dac_wdata (dac_wdata),
+        .dac_rdata (dac_rdata),
+        .clk_vga   (clk_vga),
+        .pal_index (pal_index),
+        .pal_rgb   (pal_rgb)
+    );
+
     io_decode u_io (
         .clk       (clk_cpu),
         .rst_n     (rst_n),
@@ -302,6 +325,11 @@ module FPGA80186 #(
         .crtc_wr    (crtc_wr),
         .crtc_wdata (crtc_wdata),
         .crtc_rdata (crtc_rdata),
+        .dac_wr     (dac_wr),
+        .dac_port   (dac_port),
+        .dac_wdata  (dac_wdata),
+        .dac_rdata  (dac_rdata),
+        .mode_gfx   (mode_gfx),
         .stor_sel   (stor_sel),
         .stor_reg   (stor_reg),
         .stor_rd    (stor_rd),
@@ -382,6 +410,11 @@ module FPGA80186 #(
         .rst_n       (rst_vga_n),
         .vram_addr   (vram_addr),
         .vram_data   (vram_data),
+        .mode_gfx    (mode_gfx),
+        .fb_addr     (fb_read_addr),
+        .fb_data     (fb_read_data),
+        .pal_index   (pal_index),
+        .pal_rgb     (pal_rgb),
         .cursor_en   (cursor_en),
         .cursor_addr (cursor_addr),
         .vga_r       (VGA_R),

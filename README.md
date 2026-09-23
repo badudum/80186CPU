@@ -111,7 +111,7 @@ configuration and writes nothing into the working tree.
 ./sim/run.sh tb_alu       # a single module
 ```
 
-There are **26 testbenches totalling 731 checks**, all passing, plus 71
+There are **26 testbenches totalling 754 checks**, all passing, plus 71
 assembler encoding tests and 32 filesystem tests (`python3 tools/test_asm86.py`,
 `python3 tools/test_fat12.py`):
 
@@ -382,6 +382,49 @@ Conventional memory only needs 1 MB, but the disk image is meant to live
 *above* it — out of reach of any 8086 address, visible only to the block
 device. 16 MB of the chip's 64 still fits inside bank 0.
 
+## Graphics: mode 13h
+
+320x200 at eight bits per pixel, the mode every DOS game of the era used.
+`INT 10h` with `AX=0013h` switches to it; anything else switches back to text.
+
+Three pieces:
+
+- **`modules/framebuffer.sv`** — 64 KB of on-chip dual-port RAM at `A0000`.
+  On-chip is the whole point. Scanning 320x200 out at 60 Hz needs 3.84 MB/s
+  and the SDRAM controller delivers about 3.3 MB/s, because it bursts one word
+  at a time and auto-precharges every access. Display alone would consume more
+  than the memory system has, before the CPU fetched an instruction. Here
+  scan-out costs the rest of the machine nothing: it is a second port on a
+  block RAM nobody else touches. The price is 50 of 397 M10K blocks.
+- **`modules/vga_dac.sv`** — the 256-entry palette, written through ports
+  `3C8`/`3C9` exactly as software expects: the index once, then red, green and
+  blue, with the index advancing on its own so a whole palette is 768 writes.
+  Components are six bits, 0-63, as the real DAC takes them; the top two bits
+  are replicated into the bottom so 63 maps to 255 rather than 252.
+- **`vga_controller`** grows a second scan-out path. Each pixel is displayed
+  twice horizontally and twice vertically, which is how a real VGA fits 200
+  lines into a 400-line raster, and lands the image in the same 400-line window
+  the text mode already uses — so the vertical centring and sync timing are
+  shared rather than duplicated.
+
+The doubling is the part worth testing: an off-by-one there produces a picture
+that looks entirely plausible and is wrong everywhere. `tb_vga` checks the
+first and last pixel of a row, both halves of a doubled pixel and both raster
+lines of a doubled row, and `tb_bios` has the loaded kernel set the mode and
+plot through the aperture so the decode, byte lanes and DAC are covered from
+software down.
+
+### The .hex and .mif must not drift
+
+With `ISMCE` set, `bios_rom` **synthesises from `rom/bios.lo.mif`** while every
+simulation reads `rom/bios.lo.hex`. Regenerating only the `.hex` leaves the
+bitstream running the previous BIOS while every test agrees the new one works,
+and nothing in the build hints at it. That is not hypothetical: it cost an
+afternoon here, with the board booting far enough to print six lines and then
+quietly not switching video mode, because the ROM in the bitstream predated the
+mode-13h code. `tools/gen_bios.py` now writes both files together, so they
+cannot get out of step.
+
 ## Two disk backends
 
 `storage.sv` takes `USE_SDRAM`, selected at the top level by `DISK_IN_SDRAM`:
@@ -528,6 +571,7 @@ The standard PC/XT layout, which is what MS-DOS expects:
 | Range | Contents | Backed by |
 |---|---|---|
 | `00000`–`9FFFF` | conventional RAM, 640 KB | SDRAM |
+| `A0000`–`AFFFF` | graphics aperture, mode 13h | on-chip dual-port RAM |
 | `B8000`–`B8FFF` | colour text buffer, 80x25 | on-chip dual-port RAM |
 | `C0000`–`EFFFF` | option ROM / extended BIOS | unmapped |
 | `F0000`–`FFFFF` | BIOS ROM, reset vector at `FFFF0` | on-chip ROM |
@@ -541,6 +585,8 @@ I/O space:
 |---|---|
 | `0060`, `0064` | PS/2 keyboard data and status |
 | `0061` | system control port: bit 4 is the DRAM refresh toggle |
+| `03C8`, `03C9` | VGA palette DAC: index, then red/green/blue |
+| `03D8` | video mode, CGA-style; bit 1 selects graphics |
 | `0320`–`032F` | block storage (PC/XT hard-disk range) |
 | `03D4`, `03D5` | 6845 CRTC — cursor position and visibility |
 | `FF00`–`FFFF` | 80186 Peripheral Control Block (relocatable) |
@@ -605,7 +651,11 @@ conflicting pins, ports with no assignment, and the same pin used twice.
   80186's own integrated equivalents, at the 80186's own addresses. Port 61h
   exists only far enough to keep timing-calibration loops running. Software
   that programs those chips directly will not work.
-- **Text mode only.** No graphics modes; they need more VRAM than fits on-chip.
+- **One graphics mode, and it is not VGA-register compatible.** Mode 13h
+  works, set through `INT 10h` as every DOS program actually does it. Real
+  VGA mode setting programs a dozen sequencer, CRTC and graphics-controller
+  registers and none of those exist here, so software that pokes them
+  directly will not work. There are no other graphics modes.
 - **Font licensing.** `rom/font.hex` is extracted from the cp850-8x16 console
   font in the Linux `kbd` package, which is GPL-2.0. Check that before
   redistributing a bitstream. The upper half is CP850, not CP437, so the

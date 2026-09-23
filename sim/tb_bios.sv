@@ -132,7 +132,11 @@ module tb_bios;
         // After the fifth key the boot sector falls out of its loop and halts
         // for good.
         i = 0;
-        while (i < 400000) begin @(negedge CLOCK_50); i++; end
+        // Long enough for the kernel to finish echoing AND to run the
+        // graphics block after it. Clearing the 64,000-byte aperture is
+        // 32,000 word writes -- around 320,000 CPU clocks, which is nothing
+        // on hardware and dominates this wait.
+        while (i < 5000000) begin @(negedge CLOCK_50); i++; end
         chk("machine reached the boot sector's HLT", dut.halted, 1'b1);
         chk("halt is visible on LEDR[7]", LEDR[7], 1'b1);
         chk("no unexpected trap was taken", dut.dbg_int_taken, 1'b0);
@@ -198,6 +202,23 @@ module tb_bios;
         chk("INT 13h AH=08 last head and drive count",
             chip.mem['h602 >> 1], {8'((GEO_HEADS - 1)), 8'd1});
 
+        // ---- graphics mode, set and drawn by the loaded kernel ----
+        // Read straight out of the framebuffer and the palette the video
+        // controller scans, so this covers INT 10h mode 13h, the A0000
+        // decode, the byte lanes and the 3C8/3C9 DAC in one go.
+        chk("mode register selected graphics", dut.mode_gfx, 1'b1);
+        chk("kernel plotted pixel (0,0)",   dut.u_mem.u_fb.ram_lo[0], 8'h01);
+        chk("kernel plotted pixel (1,0)",   dut.u_mem.u_fb.ram_hi[0], 8'h02);
+        // 199*320 + 319 = 63999, an odd offset, so it lands in the high lane
+        // of word 31999 -- which is what makes it a byte-lane check too.
+        chk("kernel plotted the last pixel", dut.u_mem.u_fb.ram_hi[31999], 8'h03);
+        // Bar 3 covers x=48..63 of every row, so row 1 pixel 50 must be the
+        // bar index -- which also proves the row-replicating REP MOVSW ran.
+        chk("colour bars replicated down the screen",
+            dut.u_mem.u_fb.ram_lo[(320 + 50) >> 1], 8'd3);
+        chk("palette entry 1 loaded through 3C8/3C9",
+            dut.u_dac.pal[1], 18'({6'd63, 6'd0, 6'd0}));
+
         chk("no SDRAM protocol errors", chip.errors, 0);
 
         $display("");
@@ -209,7 +230,7 @@ module tb_bios;
     end
 
     initial begin
-        #120000000;
+        #400000000;
         $display("FAIL global timeout (IP=%04h halted=%b)", dut.dbg_ip, dut.halted);
         $display(" checks: %0d   failures: %0d", checks, errors + 1);
         $finish;

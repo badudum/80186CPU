@@ -356,7 +356,7 @@ def build_kernel():
     a.jz("k_tail_ok")
     a.mov_label(SI, "k_bad")
     a.call("k_puts")
-    a.jmps("k_stop")
+    a.jmp("k_stop")   # near: the graphics block below pushed this out of rel8 range
 
     a.label("k_tail_ok")
     a.mov_label(SI, "k_msg")
@@ -379,6 +379,82 @@ def build_kernel():
     a.mov(mem(disp=0x0600), AX)          # CX: CH = last cylinder, CL = SPT
     a.mov(AX, CS)
     a.mov(DS, AX)
+
+    # ---- graphics mode, from a program loaded off the filesystem ----
+    # Switching to mode 13h and plotting through the aperture is the whole
+    # graphics path end to end: INT 10h sets the mode register, the BIOS
+    # clears 64,000 bytes, and the writes below land in the framebuffer the
+    # video controller scans out. The testbench reads them back out of the
+    # real memory, so nothing here is taken on trust.
+    # A mode set homes the cursor, as it should. Save and restore it so the
+    # text the machine has already printed is not overwritten by whatever is
+    # echoed afterwards -- the text buffer survives the switch to graphics and
+    # is still what the testbench reads.
+    a.mov(AH, 0x03)
+    a.mov(BH, 0)
+    a.int_(0x10)
+    a.push(DX)
+
+    a.mov(AX, 0x0013)                    # AH=00 set mode, AL=13h
+    a.int_(0x10)
+
+    a.pop(DX)
+    a.mov(AH, 0x02)
+    a.mov(BH, 0)
+    a.int_(0x10)
+
+    a.mov(AX, 0xA000)
+    a.mov(ES, AX)
+    a.mov(DS, AX)
+    a.cld()
+
+    # Twenty colour bars, sixteen pixels each, across the top row...
+    a.mov(DI, 0x0000)
+    a.mov(BL, 0)
+    a.label("k_bar")
+    a.mov(AL, BL)
+    a.mov(CX, 16)
+    a.rep(); a.stosb()
+    a.inc(BL)
+    a.cmp(BL, 20)
+    a.jc("k_bar")
+
+    # ...then replicate that row down the screen. The source trails the
+    # destination by exactly one row, so each copied row becomes the source
+    # for the next: 199 rows for the price of one REP MOVSW rather than a
+    # nested loop over 64,000 pixels.
+    a.mov(SI, 0x0000)
+    a.mov(DI, 320)
+    a.mov(CX, 199 * 160)
+    a.rep(); a.movsw()
+
+    # Markers the testbench checks by address: two in the top-left corner and
+    # one in the very last pixel, which is at an odd offset and so proves the
+    # high byte lane as well.
+    a.mov(DI, 0x0000)
+    a.mov(AL, 0x01)
+    a.stosb()                            # pixel (0,0)
+    a.mov(AL, 0x02)
+    a.stosb()                            # pixel (1,0)
+    a.mov(DI, 63999)                     # 199*320 + 319
+    a.mov(AL, 0x03)
+    a.stosb()
+
+    a.mov(AX, CS)
+    a.mov(DS, AX)
+
+    # ...and one palette entry, the way software loads a palette: the index to
+    # 3C8, then red, green and blue to 3C9.
+    a.mov(DX, 0x03C8)
+    a.mov(AL, 0x01)
+    a.out_dx(AL)
+    a.mov(DX, 0x03C9)
+    a.mov(AL, 63)
+    a.out_dx(AL)
+    a.mov(AL, 0)
+    a.out_dx(AL)
+    a.mov(AL, 0)
+    a.out_dx(AL)
 
     # Echo a few keystrokes, which exercises the whole keyboard chain from the
     # pins up through INT 16h -- from code that was loaded off a filesystem.

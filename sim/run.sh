@@ -81,7 +81,7 @@ case "$TB" in
                             "$REPO/modules/sdram_controller.sv"
                             "$REPO/sim/sdram_model.sv") ;;
     tb_storage)        RTL=("$PKG" "$REPO/modules/storage.sv") ;;
-    tb_vga)            RTL=("$PKG" "$REPO/modules/vga_controller.sv" "$REPO/modules/font_rom.sv") ;;
+    tb_vga)            RTL=("$PKG" "$REPO/modules/vga_controller.sv" "$REPO/modules/font_rom.sv" "$REPO/modules/vga_dac.sv") ;;
     tb_sdram)          RTL=("$PKG" "$REPO/modules/sdram_controller.sv" "$REPO/sim/sdram_model.sv") ;;
     tb_top|tb_bios|tb_bios_sdramdisk|tb_msdos)    RTL=("$PKG"
                             "$REPO/modules/ALU.sv"
@@ -99,6 +99,8 @@ case "$TB" in
                             "$REPO/modules/chip_select.sv"
                             "$REPO/modules/cpu_top.sv"
                             "$REPO/modules/vram.sv"
+                            "$REPO/modules/framebuffer.sv"
+                            "$REPO/modules/vga_dac.sv"
                             "$REPO/modules/bios_rom.sv"
                             "$REPO/modules/memory_controller.sv"
                             "$REPO/modules/io_decode.sv"
@@ -114,6 +116,8 @@ case "$TB" in
                             "$REPO/modules/FPGA80186.sv") ;;
     tb_memsys)         RTL=("$PKG"
                             "$REPO/modules/vram.sv"
+                            "$REPO/modules/framebuffer.sv"
+                            "$REPO/modules/vga_dac.sv"
                             "$REPO/modules/bios_rom.sv"
                             "$REPO/modules/sdram_controller.sv"
                             "$REPO/modules/sdram_arbiter.sv"

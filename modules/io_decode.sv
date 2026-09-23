@@ -76,6 +76,15 @@ module io_decode #(
     output logic [7:0]  crtc_wdata,
     input  logic [7:0]  crtc_rdata,
 
+    // VGA palette DAC at 3C8/3C9
+    output logic        dac_wr,
+    output logic        dac_port,     // 0 = 3C8 index, 1 = 3C9 data
+    output logic [7:0]  dac_wdata,
+    input  logic [7:0]  dac_rdata,
+
+    // Video mode, CGA-style: bit 1 selects graphics
+    output logic        mode_gfx,
+
     // block storage
     output logic        stor_sel,
     output logic [2:0]  stor_reg,     // (port - 0320h) >> 1
@@ -88,6 +97,9 @@ module io_decode #(
     localparam logic [15:0] PORT_KBD_DATA = 16'h0060;
     localparam logic [15:0] PORT_KBD_STAT = 16'h0064;
     localparam logic [15:0] PORT_PPI_B    = 16'h0061;
+    localparam logic [15:0] PORT_DAC_IDX  = 16'h03C8;
+    localparam logic [15:0] PORT_DAC_DATA = 16'h03C9;
+    localparam logic [15:0] PORT_MODE     = 16'h03D8;
 
     // Block storage occupies 0320-032F, the PC/XT hard-disk controller range.
     localparam logic [11:0] PORT_STOR_PAGE = 12'h032;
@@ -135,6 +147,21 @@ module io_decode #(
     logic [7:0] ppi_rdata;
     assign ppi_rdata = {3'b000, refresh_tog, 2'b00, spk_bits};
 
+    // ---- video mode select, port 3D8 ----
+    // The CGA mode control register, of which only bit 1 -- graphics rather
+    // than text -- is implemented. This design is not VGA register
+    // compatible: real mode 13h is set by programming a dozen sequencer,
+    // CRTC and graphics-controller registers, and nothing here models them.
+    // The BIOS's INT 10h AH=00 writes this instead, so software that sets a
+    // mode the way everything actually does -- through the BIOS -- works, and
+    // software that pokes VGA registers directly does not.
+    logic hit_mode;
+    assign hit_mode = (io_addr == PORT_MODE);
+
+    logic hit_dac;
+    assign hit_dac  = (io_addr == PORT_DAC_IDX) || (io_addr == PORT_DAC_DATA);
+    assign dac_port = (io_addr == PORT_DAC_DATA);
+
     logic hit_kbd, hit_stor, hit_crtc;
     assign hit_kbd  = (io_addr == PORT_KBD_DATA) || (io_addr == PORT_KBD_STAT);
     assign kbd_port = (io_addr == PORT_KBD_STAT);
@@ -171,6 +198,14 @@ module io_decode #(
         else if (hit_ppi && io_wr && access_strobe) spk_bits <= byte_wdata[1:0];
     end
 
+    assign dac_wr     = hit_dac && io_wr && access_strobe;
+    assign dac_wdata  = byte_wdata;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                                  mode_gfx <= 1'b0;
+        else if (hit_mode && io_wr && access_strobe) mode_gfx <= byte_wdata[1];
+    end
+
     assign stor_sel   = hit_stor;
     assign stor_rd    = hit_stor && io_rd && access_strobe;
     assign stor_wr    = hit_stor && io_wr && access_strobe;
@@ -183,6 +218,11 @@ module io_decode #(
             rdata = io_addr[0] ? {kbd_rdata, 8'h00} : {8'h00, kbd_rdata};
         else if (hit_crtc)
             rdata = io_addr[0] ? {crtc_rdata, 8'h00} : {8'h00, crtc_rdata};
+        else if (hit_dac)
+            rdata = io_addr[0] ? {dac_rdata, 8'h00} : {8'h00, dac_rdata};
+        else if (hit_mode)
+            rdata = io_addr[0] ? {6'b0, mode_gfx, 9'b0}
+                               : {14'b0, mode_gfx, 1'b0};
         else if (hit_ppi)
             rdata = io_addr[0] ? {ppi_rdata, 8'h00} : {8'h00, ppi_rdata};
         else if (hit_stor)

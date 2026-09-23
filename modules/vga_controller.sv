@@ -59,6 +59,15 @@ module vga_controller #(
     output logic [10:0] vram_addr,
     input  logic [15:0] vram_data,
 
+    // graphics framebuffer read port (mode 13h) and its palette. mode_gfx
+    // crosses from the CPU clock; it changes only on a mode set, so a plain
+    // two-flop synchroniser is the right amount of machinery.
+    input  logic        mode_gfx,
+    output logic [14:0] fb_addr,
+    input  logic [15:0] fb_data,
+    output logic [7:0]  pal_index,
+    input  logic [17:0] pal_rgb,
+
     // hardware cursor, linear cell position
     input  logic        cursor_en,
     input  logic [10:0] cursor_addr,
@@ -219,6 +228,87 @@ module vga_controller #(
     assign cursor_here = cursor_en && in_text_cur && blink_cnt[4] &&
                          (cell_cur == cursor_addr) && (disp_line >= 4'd14);
 
+    // =====================================================================
+    // Graphics scan-out: 320x200 at eight bits per pixel, doubled to 640x400
+    // =====================================================================
+    // Mode 13h is displayed with every pixel twice as wide and twice as tall,
+    // which is how a real VGA fits 200 lines into a 400-line raster. That
+    // lands it in exactly the same 400-line window the text mode uses, so the
+    // vertical centring and the sync timing are shared rather than duplicated.
+    //
+    // A 16-bit word is two pixels, and each pixel is two dots, so one fetch
+    // covers four dot clocks. The lookahead is therefore FOUR, not the eight
+    // the text path needs -- text has to get through the font ROM as well.
+    logic gfx_s1, gfx;
+    always_ff @(posedge clk_vga or negedge rst_n) begin
+        if (!rst_n) begin gfx_s1 <= 1'b0; gfx <= 1'b0; end
+        else        begin gfx_s1 <= mode_gfx; gfx <= gfx_s1; end
+    end
+
+    logic [10:0] g_look;
+    logic        g_wraps;
+    logic [9:0]  g_h, g_v;
+    assign g_look  = {1'b0, h_cnt} + 11'd4;
+    assign g_wraps = (g_look >= H_TOT);
+    assign g_h     = g_wraps ? (g_look[9:0] - H_TOT[9:0]) : g_look[9:0];
+    assign g_v     = g_wraps ? ((v_cnt == V_TOT - 1) ? 10'd0 : (v_cnt + 10'd1))
+                             : v_cnt;
+
+    logic [9:0]  g_rel;
+    logic [7:0]  g_row;                  // source row, 0..199
+    logic [8:0]  g_col;                  // source column, 0..319
+    logic [15:0] g_off;                  // byte offset into the framebuffer
+    assign g_rel = g_v - TEXT_TOP[9:0];
+    assign g_row = g_rel[8:1];           // two raster lines per source line
+    assign g_col = g_h[9:1];             // two dots per source pixel
+    // row * 320 == row*256 + row*64, so no multiplier is needed.
+    assign g_off = {g_row, 8'd0} + {2'b00, g_row, 6'd0} + {7'd0, g_col};
+    assign fb_addr = g_off[15:1];
+
+    logic [15:0] g_cur, g_next;
+    always_ff @(posedge clk_vga or negedge rst_n) begin
+        if (!rst_n) begin
+            g_cur  <= 16'h0000;
+            g_next <= 16'h0000;
+        end else begin
+            // Address was presented at phase 0; the RAM answers at phase 1.
+            if (h_cnt[1:0] == 2'd1) g_next <= fb_data;
+            if (h_cnt[1:0] == 2'd3) g_cur  <= g_next;
+        end
+    end
+
+    // The palette lookup is registered, so the index has to be driven a dot
+    // EARLY -- this selects the byte for the pixel after the current one, and
+    // at the end of a group that byte lives in the word already fetched.
+    logic [7:0] nxt_byte;
+    always_comb begin
+        case (h_cnt[1:0])
+            2'd0:    nxt_byte = g_cur[7:0];
+            2'd3:    nxt_byte = g_next[7:0];
+            default: nxt_byte = g_cur[15:8];
+        endcase
+    end
+    assign pal_index = nxt_byte;
+
+    // Whether the pixel the palette is being asked about is inside the image.
+    // That pixel is the NEXT one, so its position has to be computed rather
+    // than taken from the current counters: at the last dot of a line the next
+    // pixel is dot 0 of the line below, and testing the current h_cnt there
+    // says "outside" and blanks the first pixel of every row.
+    logic [9:0] n_h, n_v;
+    assign n_h = (h_cnt == H_TOT - 1) ? 10'd0 : (h_cnt + 10'd1);
+    assign n_v = (h_cnt == H_TOT - 1)
+                 ? ((v_cnt == V_TOT - 1) ? 10'd0 : (v_cnt + 10'd1))
+                 : v_cnt;
+
+    logic g_in_next, g_in_disp;
+    assign g_in_next = (n_v >= TEXT_TOP) && (n_v < TEXT_BOT) &&
+                       (n_h < 10'd640);
+    always_ff @(posedge clk_vga or negedge rst_n) begin
+        if (!rst_n) g_in_disp <= 1'b0;
+        else        g_in_disp <= g_in_next;
+    end
+
     // ---- colour ----
     logic pixel_on;
     assign pixel_on = (shreg[7] | cursor_here) && in_text_cur;
@@ -240,8 +330,22 @@ module vga_controller #(
         endcase
     endfunction
 
+    // The DAC works in the VGA's six bits per channel, 0-63. Shifting that up
+    // by two alone would cap white at 252; replicating the top two bits into
+    // the bottom makes 63 map to 255 and 0 stay 0.
+    function automatic logic [7:0] dac8 (input logic [5:0] c);
+        dac8 = {c, c[5:4]};
+    endfunction
+
     logic [23:0] rgb;
-    assign rgb = palette(colour_idx);
+    always_comb begin
+        if (gfx)
+            rgb = g_in_disp ? {dac8(pal_rgb[17:12]), dac8(pal_rgb[11:6]),
+                               dac8(pal_rgb[5:0])}
+                            : 24'h000000;
+        else
+            rgb = palette(colour_idx);
+    end
 
     assign vga_r = active ? rgb[23:16] : 8'h00;
     assign vga_g = active ? rgb[15:8]  : 8'h00;

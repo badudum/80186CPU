@@ -56,6 +56,10 @@ module memory_controller #(
     input  logic [10:0] vram_read_addr,
     output logic [15:0] vram_read_data,
 
+    // VGA read port into the graphics framebuffer
+    input  logic [14:0] fb_read_addr,
+    output logic [15:0] fb_read_data,
+
     // ---- extra SDRAM requesters ----
     // The block device and the JTAG loader also need the memory. They live
     // outside this module, so their ports are brought out here rather than
@@ -87,10 +91,13 @@ module memory_controller #(
     localparam int RAM_AW    = $clog2(RAM_WORDS);
 
     // ---- region decode ----
-    logic in_ram, in_vram, in_rom;
+    logic in_ram, in_vram, in_fb, in_rom;
     assign in_ram  = USE_SDRAM ? (addr < 20'hA0000)
                                : ((addr < 20'hA0000) && (addr < RAM_KB * 1024));
     assign in_vram = (addr >= 20'hB8000) && (addr < 20'hB9000);
+    // The graphics aperture. Mode 13h needs 64,000 bytes at A0000; decoding a
+    // clean 64 KB window costs nothing extra and avoids an odd boundary.
+    assign in_fb   = (addr >= 20'hA0000) && (addr < 20'hB0000);
     assign in_rom  = (addr >= 20'hF0000);
 
     logic [1:0] be;
@@ -231,6 +238,20 @@ module memory_controller #(
         .vga_rdata (vram_read_data)
     );
 
+    // ---- graphics framebuffer ----
+    logic [15:0] fb_q;
+    framebuffer #(.AW(15)) u_fb (
+        .clk_cpu   (clk),
+        .cpu_addr  (addr[15:1]),
+        .cpu_wdata (wdata),
+        .cpu_we    (wr && in_fb),
+        .cpu_be    (be),
+        .cpu_rdata (fb_q),
+        .clk_vga   (clk_vga),
+        .vga_addr  (fb_read_addr),
+        .vga_rdata (fb_read_data)
+    );
+
     // ---- boot ROM ----
     logic [15:0] rom_q;
     bios_rom #(.ROM_AW(14), .ISMCE(ISMCE)) u_rom (
@@ -240,16 +261,18 @@ module memory_controller #(
     );
 
     // ---- read mux, one cycle behind the address ----
-    logic in_ram_q, in_vram_q, in_rom_q;
+    logic in_ram_q, in_vram_q, in_fb_q, in_rom_q;
     always_ff @(posedge clk) begin
         in_ram_q  <= in_ram;
         in_vram_q <= in_vram;
+        in_fb_q   <= in_fb;
         in_rom_q  <= in_rom;
     end
 
     always_comb begin
         if      (in_rom_q)  rdata = rom_q;
         else if (in_vram_q) rdata = vram_q;
+        else if (in_fb_q)   rdata = fb_q;
         else if (in_ram)    rdata = ram_q;     // SDRAM holds its data after ready
         else if (in_ram_q)  rdata = ram_q;
         else                rdata = 16'hFFFF;  // unmapped: traps as FF /7
