@@ -103,7 +103,7 @@ module tb_keyboard;
         chk("status clear after reset", v, 8'h00);
 
         // ---- one good scancode ----
-        ps2_send(8'h1C, 1'b1);              // 'A' in set 2
+        ps2_send(8'h1C, 1'b1);              // 'A': set 2 1C -> set 1 1E
         chk("data available", data_avail, 1'b1);
         chk("irq asserted with data", irq, 1'b1);
         read_status(v);
@@ -116,22 +116,25 @@ module tb_keyboard;
         chk("irq still asserted 50 clocks later", irq, 1'b1);
 
         read_data(v);
-        chk("scancode received", v, 8'h1C);
+        chk("scancode translated to set 1", v, 8'h1E);
         chk("buffer empty after read", data_avail, 1'b0);
         chk("irq released once drained", irq, 1'b0);
 
         // ---- a byte with the high bit set, and 00/FF edge cases ----
-        ps2_send(8'hF0, 1'b1);              // break prefix
+        // The break prefix is consumed, not forwarded: set 1 has no F0.
+        ps2_send(8'hF0, 1'b1);
+        chk("break prefix produces no byte of its own", data_avail, 1'b0);
+        ps2_send(8'h1C, 1'b1);              // release of 'A'
         read_data(v);
-        chk("break prefix received", v, 8'hF0);
+        chk("release arrives as set 1 code with bit 7", v, 8'h9E);
 
         ps2_send(8'h00, 1'b1);
         read_data(v);
-        chk("zero byte received", v, 8'h00);
+        chk("a code with no set 1 equivalent is dropped", data_avail, 1'b0);
 
         ps2_send(8'hFF, 1'b1);
         read_data(v);
-        chk("FF byte received", v, 8'hFF);
+        chk("FF (keyboard error) is dropped too", data_avail, 1'b0);
 
         // ---- bad parity must be dropped, not latched ----
         irq_count = 0;
@@ -143,15 +146,15 @@ module tb_keyboard;
         // the receiver must still work afterwards
         ps2_send(8'h29, 1'b1);              // space
         read_data(v);
-        chk("recovers after bad parity", v, 8'h29);
+        chk("recovers after bad parity", v, 8'h39);   // space -> set 1 39
 
         // ---- FIFO holds several bytes in order ----
         ps2_send(8'h11, 1'b1);
         ps2_send(8'h22, 1'b1);
         ps2_send(8'h33, 1'b1);
-        read_data(v); chk("fifo order 1", v, 8'h11);
-        read_data(v); chk("fifo order 2", v, 8'h22);
-        read_data(v); chk("fifo order 3", v, 8'h33);
+        read_data(v); chk("fifo order 1", v, 8'h38);   // 11 Alt   -> 38
+        read_data(v); chk("fifo order 2", v, 8'h2D);   // 22 X     -> 2D
+        read_data(v); chk("fifo order 3", v, 8'h23);   // 33 H     -> 23
         chk("fifo drained", data_avail, 1'b0);
         // With several bytes queued the request stays up between reads, so
         // the handler is re-entered until the FIFO is actually empty.
@@ -165,7 +168,82 @@ module tb_keyboard;
 
         ps2_send(8'h4B, 1'b1);
         read_data(v);
-        chk("resyncs after a stalled frame", v, 8'h4B);
+        chk("resyncs after a stalled frame", v, 8'h26);   // 4B L -> 26
+
+        // ---- extended keys ----
+        // The arrows are E0-prefixed in both sets, and the SAME table applies
+        // to the byte after the prefix. A game reads the E0, discards it, and
+        // acts on the code that follows, so the pair has to arrive intact and
+        // in order.
+        ps2_send(8'hE0, 1'b1);
+        ps2_send(8'h75, 1'b1);                          // Up
+        read_data(v); chk("extended prefix passes through", v, 8'hE0);
+        read_data(v); chk("...followed by set 1 Up", v, 8'h48);
+        chk("nothing else queued", data_avail, 1'b0);
+
+        // Releasing an extended key is E0 F0 <code> -- the F0 arrives SECOND,
+        // after the prefix. If E0 cleared the pending-break flag this would
+        // come back as a key press.
+        ps2_send(8'hE0, 1'b1);
+        ps2_send(8'hF0, 1'b1);
+        ps2_send(8'h75, 1'b1);
+        read_data(v); chk("extended release keeps its prefix", v, 8'hE0);
+        read_data(v); chk("...and sets bit 7", v, 8'hC8);
+        chk("extended release queued nothing more", data_avail, 1'b0);
+
+        // ---- the bug this was all for ----
+        // Set 2 signals a release as F0 <code>. Software that tests bit 7 --
+        // which is every DOS game, DOOM8088 included -- reads the F0 prefix
+        // itself as a key-up and then the real code as a key-DOWN, so keys
+        // latch on. Press and release must produce exactly two bytes, the
+        // second being the first with bit 7 set, and no 0xF0 anywhere.
+        ps2_send(8'h1D, 1'b1);              // press W (set 2 1D -> set 1 11)
+        ps2_send(8'hF0, 1'b1);
+        ps2_send(8'h1D, 1'b1);              // release W
+        read_data(v); chk("press produces the make code", v, 8'h11);
+        read_data(v); chk("release produces make|80, not a second press",
+                          v, 8'h91);
+        chk("a press and release are exactly two bytes", data_avail, 1'b0);
+
+        // ---- a break prefix stranded by a dropped frame ----
+        // F0 arms the release flag and the code that follows consumes it. If
+        // that code is lost to bad parity the flag is left armed, and the
+        // next key would come back as a release -- a keypress the game never
+        // sees. E0 clearing the flag is what stops one corrupt frame turning
+        // into a stuck control.
+        ps2_send(8'hF0, 1'b1);              // release prefix...
+        ps2_send(8'h1C, 1'b0);              // ...whose code is corrupt
+        chk("the corrupt frame produced nothing", data_avail, 1'b0);
+        ps2_send(8'hE0, 1'b1);
+        ps2_send(8'h75, 1'b1);              // Up, pressed
+        read_data(v); chk("stranded break: prefix still passes", v, 8'hE0);
+        read_data(v); chk("stranded break: Up is a PRESS, not a release",
+                          v, 8'h48);
+
+        // ---- the keys DOOM8088 actually binds ----
+        // Its constants, from its own source: arrows 48/50/4B/4D, Ctrl 1D,
+        // Alt 38, Shift 2A/36. These are the mappings that decide whether the
+        // game is playable, so they are asserted by name rather than left to
+        // a general table check.
+        ps2_send(8'hE0, 1'b1); ps2_send(8'h72, 1'b1);
+        read_data(v); read_data(v); chk("Down  -> 50", v, 8'h50);
+        ps2_send(8'hE0, 1'b1); ps2_send(8'h6B, 1'b1);
+        read_data(v); read_data(v); chk("Left  -> 4B", v, 8'h4B);
+        ps2_send(8'hE0, 1'b1); ps2_send(8'h74, 1'b1);
+        read_data(v); read_data(v); chk("Right -> 4D", v, 8'h4D);
+        ps2_send(8'h14, 1'b1); read_data(v); chk("Ctrl  -> 1D (fire)",  v, 8'h1D);
+        ps2_send(8'h11, 1'b1); read_data(v); chk("Alt   -> 38 (strafe)", v, 8'h38);
+        ps2_send(8'h12, 1'b1); read_data(v); chk("LShift-> 2A (run)",   v, 8'h2A);
+        ps2_send(8'h59, 1'b1); read_data(v); chk("RShift-> 36",         v, 8'h36);
+        ps2_send(8'h5A, 1'b1); read_data(v); chk("Enter -> 1C (use)",   v, 8'h1C);
+        ps2_send(8'h29, 1'b1); read_data(v); chk("Space -> 39 (use)",   v, 8'h39);
+        ps2_send(8'h76, 1'b1); read_data(v); chk("Esc   -> 01 (menu)",  v, 8'h01);
+        ps2_send(8'h0D, 1'b1); read_data(v); chk("Tab   -> 0F (map)",   v, 8'h0F);
+        ps2_send(8'h09, 1'b1); read_data(v); chk("F10   -> 44 (quit)",  v, 8'h44);
+        ps2_send(8'h54, 1'b1); read_data(v); chk("[     -> 1A (weapon)",v, 8'h1A);
+        ps2_send(8'h5B, 1'b1); read_data(v); chk("]     -> 1B (weapon)",v, 8'h1B);
+        ps2_send(8'h41, 1'b1); read_data(v); chk("comma -> 33 (strafe L)", v, 8'h33);
+        ps2_send(8'h49, 1'b1); read_data(v); chk("period-> 34 (strafe R)", v, 8'h34);
 
         $display("");
         $display("==================================");

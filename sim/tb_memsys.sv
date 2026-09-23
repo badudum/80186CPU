@@ -45,6 +45,7 @@ module tb_memsys;
         .dram_addr (dram_addr), .dram_ba (dram_ba), .dram_dq (dram_dq),
         .dram_cke (dram_cke), .dram_cs_n (dram_cs_n), .dram_ras_n (dram_ras_n),
         .dram_cas_n (dram_cas_n), .dram_we_n (dram_we_n), .dram_dqm (dram_dqm),
+        .dram_clk_in (~clk),
         .dram_clk (dram_clk)
     );
 

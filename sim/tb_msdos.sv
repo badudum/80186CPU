@@ -63,6 +63,18 @@ module tb_msdos;
     // MS-DOS times its startup waits in ticks, and at the real 18.2 Hz the
     // F5/F8 prompt alone is fifty million clocks of doing nothing. This is the
     // only difference from the ROM that goes on the board.
+    // Cache size is deliberately NOT overridden here, so this measures the
+    // cache the board is actually built with. Measured on this workload,
+    // against the same MS-DOS boot:
+    //
+    //     cache    stalled on SDRAM    memory accesses completed per cycle
+    //     none          44.4%                     1.00x
+    //     8 KB          26.3%                     1.28x
+    //     32 KB         23.3%                     1.33x
+    //
+    // Four times the cache for another four percent: the misses that remain
+    // are not capacity misses, so the next real gain is associativity, not
+    // size. Put a `defparam dut.CACHE_KB = ...` here to re-measure.
     defparam dut.u_mem.u_rom.INIT_LO = "rom/fast/bios.lo.hex";
     defparam dut.u_mem.u_rom.INIT_HI = "rom/fast/bios.hi.hex";
 
@@ -87,6 +99,20 @@ module tb_msdos;
     wire [15:0] ds_now  = `REGS.sreg[S_DS];
     wire [15:0] es_now  = `REGS.sreg[S_ES];
     wire [15:0] ip_now  = `EXEC.instr_start_ip;
+
+    // Same stall accounting as tb_bios, but against real MS-DOS code running
+    // from SDRAM rather than a BIOS running from on-chip ROM -- which is the
+    // workload the question "would a cache help" is really about.
+    int stall_ram = 0, stall_other = 0, bus_cycles = 0;
+    always @(posedge dut.clk_cpu) begin
+        if (dut.rd || dut.wr) begin
+            bus_cycles++;
+            if (!dut.ready) begin
+                if (dut.u_mem.in_ram) stall_ram++;
+                else                  stall_other++;
+            end
+        end
+    end
 
     int cycles = 0;
     always @(posedge dut.clk_cpu) cycles++;
@@ -468,6 +494,12 @@ module tb_msdos;
         $display(" DS %04h  SS %04h", ds_now, `REGS.sreg[S_SS]);
         $display(" screen: \"%s\"", line);
         $display(" segment loads of A000 seen: %0d", seg_hits);
+        $display(" %0d cycles, %0d with a bus request (%0.1f%%)",
+                 cycles, bus_cycles, 100.0 * bus_cycles / cycles);
+        $display(" stalled on SDRAM:     %0d (%0.1f%%)",
+                 stall_ram, 100.0 * stall_ram / cycles);
+        $display(" stalled on ROM/other: %0d (%0.1f%%)",
+                 stall_other, 100.0 * stall_other / cycles);
         show_regs();
         // The loop it is sitting in, for an offline disassembly.
         dump_mem(int'(cs_now) * 16 + int'(ip_now) - 128, 256);

@@ -96,8 +96,43 @@ P_T2_CTL = P_PCB + 0x66
 
 # Timer 0 counts timer 2 timeouts; timer 2 counts the CPU clock / 4.
 # 25 MHz / 4 = 6.25 MHz, / 64 = 97656 Hz, / 5366 = 18.199 Hz -- the PC rate.
+#
+# THE DIVISOR IS TIED TO THE CPU CLOCK, so raising the clock without raising
+# this makes the BIOS tick fast and every DOS program that measures time --
+# which is every game -- run at the wrong speed, with nothing on screen to say
+# why. `--clk-hz` exists so the rate lives in one place; FPGA80186.sv's CLK_HZ
+# is the same number on the hardware side and the two must agree.
+CLK_HZ = 25_000_000
+_argv = []
+_skip = False
+for _i, _a in enumerate(sys.argv):
+    if _skip:
+        _skip = False
+        continue
+    if _a == "--clk-hz":
+        CLK_HZ = int(sys.argv[_i + 1])
+        _skip = True                 # the value is not the output directory
+    elif _a.startswith("--clk-hz="):
+        CLK_HZ = int(_a.split("=", 1)[1])
+    else:
+        _argv.append(_a)
+sys.argv = _argv
+
 T2_DIVISOR = 64
-T0_DIVISOR = 5366
+# 18.2065 Hz is the PC's tick. Round rather than truncate: at 40 MHz the exact
+# quotient is 8584.6, and the floor is half a tick per second slow.
+if CLK_HZ == 25_000_000:
+    # Pinned to the value the working 25 MHz ROM has always used. The formula
+    # below gives 5364, which is marginally MORE accurate, but changing a ROM
+    # that boots DOS today for a 0.04% tick correction means the fallback
+    # build is no longer the one known to work. Not worth it.
+    T0_DIVISOR = 5366
+else:
+    T0_DIVISOR = int(round(CLK_HZ / 4.0 / T2_DIVISOR / 18.2065))
+if CLK_HZ != 25_000_000:
+    print("clock %0.3f MHz: T0 divisor %d (%0.4f Hz tick)"
+          % (CLK_HZ / 1e6, T0_DIVISOR,
+             CLK_HZ / 4.0 / T2_DIVISOR / T0_DIVISOR))
 
 # `--fast-tick` divides the tick period by 64, which is only ever used to build
 # a ROM for sim/tb_msdos.sv. MS-DOS times its startup waits in BIOS ticks -- the
@@ -732,14 +767,10 @@ a.mov(DX, P_KBD_DATA)
 a.in_dx(AL)
 a.mov(BL, AL)                     # keep the raw scancode
 
-# F0 introduces a key RELEASE; E0 introduces an extended key.
-a.cmp(AL, 0xF0)
-a.jnz("i09_not_break")
-a.mov(AL, 1)
-a.mov(mem(disp=B_BREAK), AL)
-a.jmp("i09_leave")
-
-a.label("i09_not_break")
+# THE BYTES HERE ARE SET 1, not set 2. keyboard_controller.sv translates on
+# the way in, so a RELEASE is bit 7 of the scancode rather than a preceding F0
+# -- which also means a release no longer costs an extra interrupt. E0 still
+# introduces an extended key; set 1 uses that prefix too.
 a.cmp(AL, 0xE0)
 a.jnz("i09_not_ext")
 a.mov(AL, 1)
@@ -747,10 +778,17 @@ a.mov(mem(disp=B_EXTEND), AL)
 a.jmp("i09_leave")
 
 a.label("i09_not_ext")
+# Split the make code from the release bit. BL is the key from here on, and
+# B_BREAK is non-zero if this was a release.
+a.mov(AL, BL)
+a.and_(AL, 0x80)
+a.mov(mem(disp=B_BREAK), AL)
+a.and_(BL, 0x7F)
+
 # Shift keys maintain state on both press and release.
-a.cmp(BL, 0x12)                   # left shift
+a.cmp(BL, 0x2A)                   # left shift
 a.jz("i09_shift")
-a.cmp(BL, 0x59)                   # right shift
+a.cmp(BL, 0x36)                   # right shift
 a.jnz("i09_not_shift")
 
 a.label("i09_shift")
@@ -1199,7 +1237,14 @@ a.jmps("illegal_halt")
 # ===========================================================================
 # Scancode tables -- PS/2 set 2 to ASCII
 # ===========================================================================
-SET2_BASE = {
+# The keyboard, and which scancode set this table is in.
+#
+# keyboard_controller.sv translates set 2 to set 1 before software ever sees a
+# byte, exactly as a PC's 8042 does, so everything below is SET 1. It is
+# derived from the set 2 map rather than retyped, using the same table the
+# hardware is generated from -- see tools/scancodes.py for why there is only
+# one copy of it.
+_SET2_BASE = {
     0x1C: 'a', 0x32: 'b', 0x21: 'c', 0x23: 'd', 0x24: 'e', 0x2B: 'f',
     0x34: 'g', 0x33: 'h', 0x43: 'i', 0x3B: 'j', 0x42: 'k', 0x4B: 'l',
     0x3A: 'm', 0x31: 'n', 0x44: 'o', 0x4D: 'p', 0x15: 'q', 0x2D: 'r',
@@ -1212,6 +1257,15 @@ SET2_BASE = {
     0x4C: ';', 0x52: "'", 0x41: ',', 0x49: '.', 0x4A: '/', 0x0E: '`',
 }
 
+from scancodes import SET2_TO_SET1                             # noqa: E402
+
+SET1_BASE = {}
+for _s2, _ch in _SET2_BASE.items():
+    _s1 = SET2_TO_SET1.get(_s2)
+    assert _s1, "set 2 %02X has no set 1 code; the tables disagree" % _s2
+    assert _s1 not in SET1_BASE, "set 1 %02X claimed twice" % _s1
+    SET1_BASE[_s1] = _ch
+
 SHIFT_MAP = {
     '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^',
     '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+',
@@ -1222,7 +1276,7 @@ SHIFT_MAP = {
 
 def build_table(shifted):
     t = bytearray(128)
-    for code, ch in SET2_BASE.items():
+    for code, ch in SET1_BASE.items():
         if shifted:
             ch = ch.upper() if ch.isalpha() else SHIFT_MAP.get(ch, ch)
         t[code] = ord(ch)
@@ -1311,6 +1365,19 @@ with open(os.path.join(out, "bios.map"), "w") as f:
     f.write("# FPGA80186 BIOS symbols, CS=F000\n")
     for name, addr in sorted(a.labels.items(), key=lambda kv: kv[1]):
         f.write("%04X %s\n" % (addr, name))
+
+# The clock rate this ROM's timer divisor was computed for, written out so the
+# hardware can refuse to build against a ROM meant for a different clock. Two
+# numbers in two languages in two files WILL drift, and the symptom when they
+# do is not a build error -- it is every DOS program that measures time running
+# at the wrong speed, which looks like a dozen other things first.
+with open(os.path.join(out, "clk.svh"), "w") as f:
+    f.write("// Written by tools/gen_bios.py -- do not edit.\n")
+    f.write("// The CPU clock rate this BIOS's timer divisor assumes.\n")
+    f.write("// FPGA80186.sv checks its own CLK_HZ against this and refuses\n")
+    f.write("// to compile if they differ. Rebuild the ROM with\n")
+    f.write("//     python3 tools/gen_bios.py --clk-hz <rate> rom/\n")
+    f.write("localparam int ROM_CLK_HZ = %d;\n" % CLK_HZ)
 
 used = code_end - 0x100
 print("BIOS: %d bytes of code and data (%.1f%% of %d KB)"

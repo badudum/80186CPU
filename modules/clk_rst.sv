@@ -47,13 +47,17 @@
 `timescale 1ns/1ns
 module clk_rst #(
     // ~10 ms at 50 MHz. Overridden low by the testbench, which has no patience.
-    parameter int DEBOUNCE = 500000
+    parameter int DEBOUNCE = 500000,
+    // Where the clocks come from: 0 = CLOCK_50/2, 1 = the Quartus PLL IP,
+    // 2 = a behavioural model of it at the same rates. See pll.sv.
+    parameter int PLL_MODE = 2
 ) (
     input  logic clk_board,    // CLOCK_50
     input  logic rst_btn_n,    // KEY[0], active low
 
-    output logic clk_cpu,      // 25 MHz
-    output logic clk_vga,      // 25 MHz (the same net as clk_cpu)
+    output logic clk_cpu,      // 40 MHz, or 25 MHz in PLL_MODE 0
+    output logic clk_vga,      // 25.185 MHz, or the same net in PLL_MODE 0
+    output logic clk_dram,     // driven straight out to the memory
     output logic rst_n,        // synchronised to clk_cpu
     output logic rst_vga_n     // synchronised to clk_vga
 );
@@ -64,11 +68,15 @@ module clk_rst #(
     // block at the bottom, because they ARE the reset source and so cannot
     // themselves be reset. always_ff forbids that second driver. Quartus
     // honours initial values as the power-up state on Cyclone V.
-    logic clk_sys_r;
-    always @(posedge clk_board) clk_sys_r <= ~clk_sys_r;
-
-    assign clk_cpu = clk_sys_r;
-    assign clk_vga = clk_sys_r;
+    logic pll_locked;
+    pll #(.PLL_MODE(PLL_MODE)) u_pll (
+        .clk_board (clk_board),
+        .rst_btn_n (rst_btn_n),
+        .clk_sys   (clk_cpu),
+        .clk_vga   (clk_vga),
+        .clk_dram  (clk_dram),
+        .locked    (pll_locked)
+    );
 
     // ---- button debounce ----
     // The button is only accepted as changed once it has held its new value
@@ -105,7 +113,12 @@ module clk_rst #(
     end
 
     logic rst_src_n;
-    assign rst_src_n = btn_stable && por_done;
+    // The PLL's lock is part of the reset source: until it asserts, clk_cpu is
+    // whatever the PLL happens to be doing on its way to the right frequency,
+    // and letting the design run on that is how a board comes up working four
+    // times out of five. Without a PLL `locked` is tied high and this reduces
+    // to what it was.
+    assign rst_src_n = btn_stable && por_done && pll_locked;
 
     // ---- per-domain deassertion synchronisers ----
     logic [1:0] sync_cpu, sync_vga;
@@ -123,7 +136,6 @@ module clk_rst #(
     assign rst_vga_n = sync_vga[1];
 
     initial begin
-        clk_sys_r  = 1'b0;
         btn_meta   = 1'b1;
         btn_sync   = 1'b1;
         btn_stable = 1'b0;      // start held in reset

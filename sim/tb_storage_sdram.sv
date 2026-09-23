@@ -97,6 +97,11 @@ module tb_storage_sdram;
         .dram_addr (dram_addr), .dram_ba (dram_ba), .dram_dq (dram_dq),
         .dram_cke (dram_cke), .dram_cs_n (dram_cs_n), .dram_ras_n (dram_ras_n),
         .dram_cas_n (dram_cas_n), .dram_we_n (dram_we_n), .dram_dqm (dram_dqm),
+        // The memory clock is supplied rather than derived inside the
+        // controller, so the real design can phase-shift it from the PLL.
+        // Inverting `clk` is exactly what the controller used to do for
+        // itself, so these tests still measure what they were written against.
+        .dram_clk_in (~clk),
         .dram_clk (dram_clk)
     );
 

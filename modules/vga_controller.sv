@@ -225,8 +225,32 @@ module vga_controller #(
     assign disp_line = disp_rel[3:0];
 
     logic cursor_here;
-    assign cursor_here = cursor_en && in_text_cur && blink_cnt[4] &&
-                         (cell_cur == cursor_addr) && (disp_line >= 4'd14);
+    // The cursor crosses the same boundary, and until the PLL arrived it did
+    // not need to: clk_vga was clk_cpu divided by two, so the two edges were
+    // aligned and a plain wire was safe. With the PLL they are separate
+    // outputs at unrelated rates and this is a real crossing -- an unsynchro-
+    // nised one would go metastable, occasionally, as a flickering cursor
+    // that looks like a display bug rather than a clocking one.
+    //
+    // cursor_addr is a bus, so two flops can catch it mid-change and land on
+    // a value that was never written. That is tolerable HERE and nowhere
+    // else: the worst case is the cursor drawn in the wrong cell for a single
+    // frame, at the moment it moves, which is 16 ms and invisible. A bus
+    // whose wrong values mattered would need a handshake instead.
+    logic        cur_en_s1, cur_en_q;
+    logic [10:0] cur_ad_s1, cur_ad_q;
+    always_ff @(posedge clk_vga or negedge rst_n) begin
+        if (!rst_n) begin
+            cur_en_s1 <= 1'b0; cur_en_q <= 1'b0;
+            cur_ad_s1 <= '0;   cur_ad_q <= '0;
+        end else begin
+            cur_en_s1 <= cursor_en;   cur_en_q <= cur_en_s1;
+            cur_ad_s1 <= cursor_addr; cur_ad_q <= cur_ad_s1;
+        end
+    end
+
+    assign cursor_here = cur_en_q && in_text_cur && blink_cnt[4] &&
+                         (cell_cur == cur_ad_q) && (disp_line >= 4'd14);
 
     // =====================================================================
     // Graphics scan-out: 320x200 at eight bits per pixel, doubled to 640x400

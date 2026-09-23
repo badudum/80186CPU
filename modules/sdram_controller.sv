@@ -94,7 +94,8 @@ module sdram_controller #(
     output logic        dram_cas_n,
     output logic        dram_we_n,
     output logic [1:0]  dram_dqm,
-    output logic        dram_clk
+    output logic        dram_clk,
+    input  logic        dram_clk_in
 );
 
     // Command encoding: {cs_n, ras_n, cas_n, we_n}
@@ -164,7 +165,10 @@ module sdram_controller #(
     logic        page_hit;
     assign page_hit = row_open && (row == open_row);
     assign dram_cke  = 1'b1;
-    assign dram_clk  = ~clk;
+    // Driven from the clock generator rather than inverted here: with a PLL
+    // it is phase-shifted, and without one the generator inverts it exactly as
+    // this line used to.
+    assign dram_clk  = dram_clk_in;
     assign dram_dq   = dq_oe ? dq_out : 16'hzzzz;
 
     // DQM masks bytes on a write and must be low during a read.

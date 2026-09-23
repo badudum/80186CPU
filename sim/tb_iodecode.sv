@@ -219,6 +219,9 @@ module tb_iodecode;
         @(negedge clk);
 
         // ---- three scancodes queued, read back over the real bus ----
+        // Sent as set 2 and read back as set 1: keyboard_controller translates
+        // on the way in, so what reaches port 60h is what a PC's 8042 would
+        // present. 11 Alt -> 38, 22 X -> 2D, 33 H -> 23.
         ps2_send(8'h11);
         ps2_send(8'h22);
         ps2_send(8'h33);
@@ -235,11 +238,11 @@ module tb_iodecode;
 
         // Each of these must return the NEXT byte, not the one after it.
         bus_read(16'h0060, d);
-        chk("bus read 1 returned the first scancode", d, 16'h0011);
+        chk("bus read 1 returned the first scancode", d, 16'h0038);
         bus_read(16'h0060, d);
-        chk("bus read 2 returned the second scancode", d, 16'h0022);
+        chk("bus read 2 returned the second scancode", d, 16'h002D);
         bus_read(16'h0060, d);
-        chk("bus read 3 returned the third scancode", d, 16'h0033);
+        chk("bus read 3 returned the third scancode", d, 16'h0023);
 
         chk("FIFO drained by exactly three reads", kbd_avail, 1'b0);
         chk("one strobe per bus cycle", kbd_rd_pulses, 3);
@@ -250,9 +253,9 @@ module tb_iodecode;
         ps2_send(8'h55);
 
         bus_read(16'h0060, d);
-        chk("later read returned the right byte", d, 16'h0044);
+        chk("later read returned the right byte", d, 16'h0018);   // set 2 44
         bus_read(16'h0060, d);
-        chk("later read 2 returned the right byte", d, 16'h0055);
+        chk("later read 2 returned the right byte", d, 16'h000D);   // set 2 55
         chk("FIFO drained again", kbd_avail, 1'b0);
         chk("still one strobe per cycle", kbd_rd_pulses, 2);
 
@@ -261,7 +264,7 @@ module tb_iodecode;
         chk("empty read did not wrap the FIFO", kbd_avail, 1'b0);
         ps2_send(8'h66);
         bus_read(16'h0060, d);
-        chk("FIFO still correct after an empty read", d, 16'h0066);
+        chk("FIFO still correct after an empty read", d, 16'h000E);   // set 2 66
 
         // ---- port 61h: the refresh toggle must actually toggle ----
         // PC software calibrates delay loops by watching bit 4 change, in
@@ -350,7 +353,7 @@ module tb_iodecode;
         // A keyboard access must not have been disturbed by any of that.
         ps2_send(8'h77);
         bus_read(16'h0060, d);
-        chk("keyboard still correct after storage traffic", d, 16'h0077);
+        chk("keyboard still correct after storage traffic", d, 16'h0045);   // set 2 77
 
         // ---- CRTC, and with it the odd-address byte lane ----
         // 3D4 is even and 3D5 is odd, so this pair exercises both lanes in

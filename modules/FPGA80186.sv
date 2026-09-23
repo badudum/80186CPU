@@ -61,7 +61,16 @@ module FPGA80186 #(
     // Makes the BIOS and font ROMs visible to the In-System Memory Content
     // Editor, so their contents can be replaced over JTAG without a rebuild.
     // Off for simulation, which reads the .hex images directly.
-    parameter bit ISMCE = 1'b0
+    parameter bit ISMCE = 1'b0,
+    // Where the clocks come from. 1 is the Quartus PLL IP and is what the
+    // .qsf sets; 2 is a behavioural model of it at the SAME rates, which is
+    // what simulation runs; 0 is the historical CLOCK_50/2 build at 25 MHz.
+    // Only mode 0 changes any frequency -- see pll.sv.
+    parameter int PLL_MODE = 2,
+    // SDRAM cache. See cache.sv for the measurement that motivates it; 0
+    // turns it off and restores the direct path.
+    parameter int CACHE_KB         = 8,
+    parameter int CACHE_LINE_WORDS = 4
 ) (
     // Board clock and reset
     input  logic        CLOCK_50,
@@ -101,11 +110,45 @@ module FPGA80186 #(
     // ---- clocks and reset ----
     logic clk_cpu, clk_vga, rst_n, rst_vga_n;
 
-    clk_rst u_clk_rst (
+    // ---- everything that has to track the clock rate ----
+    // These are not tuning knobs. Refresh is a DEADLINE -- overshoot it and
+    // memory corrupts silently, hours later, looking like anything but a
+    // clock change. The other two are visible as software running at the
+    // wrong speed. Deriving all of them from one number is the only way this
+    // stays right when the number moves.
+    localparam int CLK_HZ = (PLL_MODE == 0) ? 25_000_000 : 40_000_000;
+
+    // The BIOS ROM computes its timer divisor from a clock rate too, and that
+    // number lives in a different file in a different language. rom/clk.svh is
+    // written by tools/gen_bios.py with the rate it used, so a mismatch stops
+    // the build instead of shipping a machine whose clock runs at the wrong
+    // speed -- which presents as games running too fast and nothing else.
+    // The error is the instance name below; rebuild the ROM with
+    //     python3 tools/gen_bios.py --clk-hz <CLK_HZ> rom/
+    // The explicit generate/endgenerate is required: Quartus's Verilog parser
+    // rejects a bare conditional generate at module scope, though ModelSim
+    // accepts it.
+    `include "clk.svh"
+    generate
+        if (CLK_HZ != ROM_CLK_HZ) begin : g_clk_mismatch
+            BIOS_ROM_WAS_BUILT_FOR_A_DIFFERENT_CLOCK_RATE_rerun_gen_bios u_err ();
+        end
+    endgenerate
+
+    // 8192 refreshes per 64 ms is one every 7.8 us; 7 us leaves margin.
+    localparam int REFRESH_CYCLES = (CLK_HZ / 1_000_000) * 7;
+    // Port 61h bit 4 flips every 15.085 us.
+    localparam int REFRESH_DIV    = ((CLK_HZ / 1_000_000) * 15_085) / 1_000;
+    // The PC's interval timer runs at 1.193182 MHz.
+    localparam int PIT_CLK_DIV    = (CLK_HZ + 596_591) / 1_193_182;
+
+    logic clk_dram;
+    clk_rst #(.PLL_MODE(PLL_MODE)) u_clk_rst (
         .clk_board  (CLOCK_50),
         .rst_btn_n  (KEY[0]),
         .clk_cpu    (clk_cpu),
         .clk_vga    (clk_vga),
+        .clk_dram   (clk_dram),
         .rst_n      (rst_n),
         .rst_vga_n  (rst_vga_n)
     );
@@ -260,7 +303,11 @@ module FPGA80186 #(
     endgenerate
 
 
-    memory_controller #(.USE_SDRAM(1'b1), .ISMCE(ISMCE)) u_mem (
+    memory_controller #(.USE_SDRAM(1'b1), .ISMCE(ISMCE),
+                        .SDRAM_INIT_CYCLES(CLK_HZ / 5000),   // 200 us
+                        .REFRESH_CYCLES(REFRESH_CYCLES),
+                        .CACHE_KB(CACHE_KB),
+                        .CACHE_LINE_WORDS(CACHE_LINE_WORDS)) u_mem (
         .clk            (clk_cpu),
         .rst_n          (rst_n),
         .addr           (addr),
@@ -298,7 +345,8 @@ module FPGA80186 #(
         .dram_cas_n     (DRAM_CAS_N),
         .dram_we_n      (DRAM_WE_N),
         .dram_dqm       (dram_dqm),
-        .dram_clk       (DRAM_CLK)
+        .dram_clk       (DRAM_CLK),
+        .dram_clk_in    (clk_dram)
     );
 
     // ---- I/O side ----
@@ -314,7 +362,7 @@ module FPGA80186 #(
     logic [2:0]  stor_reg;
     logic [15:0] stor_wdata, stor_rdata;
 
-    pit8253 u_pit (
+    pit8253 #(.CLK_DIV(PIT_CLK_DIV)) u_pit (
         .clk            (clk_cpu),
         .rst_n          (rst_n),
         .sel            (pit_sel),
@@ -357,7 +405,7 @@ module FPGA80186 #(
         .pal_rgb   (pal_rgb)
     );
 
-    io_decode u_io (
+    io_decode #(.REFRESH_DIV(REFRESH_DIV)) u_io (
         .clk       (clk_cpu),
         .rst_n     (rst_n),
         .io_addr   (addr[15:0]),

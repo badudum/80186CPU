@@ -36,6 +36,16 @@ module memory_controller #(
     // Power-up delay the SDRAM needs before it accepts commands. Real parts
     // want 200 us; a testbench cannot afford to simulate that.
     parameter int SDRAM_INIT_CYCLES = 5000,
+    // Refresh interval in clocks. Rate-dependent, so the top level computes
+    // it from the real clock rate and passes it through rather than letting
+    // a default stand that was right for a different clock.
+    parameter int REFRESH_CYCLES = 175,
+    // Cache in front of the SDRAM. 0 disables it entirely and restores the
+    // direct path, which is worth keeping: it is the baseline every cache
+    // measurement is against, and the thing to fall back to if the cache is
+    // ever suspected. See cache.sv.
+    parameter int CACHE_KB         = 8,
+    parameter int CACHE_LINE_WORDS = 4,
     parameter bit ISMCE = 1'b0
 ) (
     input  logic        clk,
@@ -95,7 +105,11 @@ module memory_controller #(
     output logic        dram_cas_n,
     output logic        dram_we_n,
     output logic [1:0]  dram_dqm,
-    output logic        dram_clk
+    output logic        dram_clk,
+    // The clock the memory is actually given: with a PLL it is phase-shifted
+    // rather than simply inverted, which is the whole reason a PLL buys any
+    // speed here at all. See pll.sv.
+    input  logic        dram_clk_in
 );
 
     localparam int RAM_WORDS = (RAM_KB * 1024) / 2;
@@ -134,11 +148,71 @@ module memory_controller #(
 
             // Port 0 is the CPU. Its address is only 20 bits wide, so it
             // reaches the bottom 1 MB and cannot see the disk above it.
-            assign arb_rd[0]    = rd && in_ram;
-            assign arb_wr[0]    = wr && in_ram;
-            assign arb_addr[0]  = {4'h0, addr};
-            assign arb_wdata[0] = wdata;
-            assign arb_be[0]    = be;
+            if (CACHE_KB > 0) begin : g_cache
+                // The cache owns port 0 and speaks the same contract to the
+                // arbiter that the CPU did, so nothing downstream changes.
+                logic [23:0] ca_addr;
+                logic [15:0] ca_wdata, ca_rdata;
+                logic [1:0]  ca_be;
+                logic        ca_rd, ca_wr;
+                logic        snoop_wr;
+                logic [23:0] snoop_addr;
+
+                // Any write by another master is offered to the cache; it
+                // decides whether the address could alias anything the CPU
+                // can see. Taken from the REQUEST rather than the grant, so
+                // the invalidation cannot arrive after a stale read.
+                //
+                // When both masters are writing, the LOWER address is the one
+                // offered. Only one can be passed and the cache's test is
+                // "below 1 MB", so if either qualifies the minimum does --
+                // and since the response is to invalidate everything, which
+                // of the two it was makes no difference. Picking arbitrarily
+                // would let a foreign write to low memory go unseen whenever
+                // the other master happened to be busy.
+                assign snoop_wr   = ext_wr[0] || ext_wr[1];
+                assign snoop_addr = (ext_wr[0] &&
+                                     (!ext_wr[1] || ext_addr[0] < ext_addr[1]))
+                                    ? ext_addr[0] : ext_addr[1];
+
+                cache #(.KB(CACHE_KB), .LINE_WORDS(CACHE_LINE_WORDS)) u_cache (
+                    .clk        (clk),
+                    .rst_n      (rst_n),
+                    .c_addr     (addr),
+                    .c_wdata    (wdata),
+                    .c_rdata    (ca_rdata),
+                    .c_rd       (rd && in_ram),
+                    .c_wr       (wr && in_ram),
+                    .c_be       (be),
+                    .c_ready    (ram_ready),
+                    .m_addr     (ca_addr),
+                    .m_wdata    (ca_wdata),
+                    .m_rdata    (arb_rdata),
+                    .m_rd       (ca_rd),
+                    .m_wr       (ca_wr),
+                    .m_be       (ca_be),
+                    .m_ready    (arb_ready[0]),
+                    .snoop_wr   (snoop_wr),
+                    .snoop_addr (snoop_addr),
+                    .stat_hit   (),
+                    .stat_miss  ()
+                );
+
+                assign arb_rd[0]    = ca_rd;
+                assign arb_wr[0]    = ca_wr;
+                assign arb_addr[0]  = ca_addr;
+                assign arb_wdata[0] = ca_wdata;
+                assign arb_be[0]    = ca_be;
+                assign ram_q        = ca_rdata;
+            end else begin : g_nocache
+                assign arb_rd[0]    = rd && in_ram;
+                assign arb_wr[0]    = wr && in_ram;
+                assign arb_addr[0]  = {4'h0, addr};
+                assign arb_wdata[0] = wdata;
+                assign arb_be[0]    = be;
+                assign ram_q        = arb_rdata;
+                assign ram_ready    = arb_ready[0];
+            end
 
             assign arb_rd[2:1]  = ext_rd;
             assign arb_wr[2:1]  = ext_wr;
@@ -149,8 +223,6 @@ module memory_controller #(
             assign arb_be[1]    = ext_be[0];
             assign arb_be[2]    = ext_be[1];
 
-            assign ram_q     = arb_rdata;
-            assign ram_ready = arb_ready[0];
             assign ext_ready = arb_ready[2:1];
             assign ext_rdata = arb_rdata;
 
@@ -173,7 +245,8 @@ module memory_controller #(
                 .mem_ready (mem_ready)
             );
 
-            sdram_controller #(.INIT_CYCLES(SDRAM_INIT_CYCLES)) u_sdram (
+            sdram_controller #(.INIT_CYCLES(SDRAM_INIT_CYCLES),
+                              .REFRESH_CYCLES(REFRESH_CYCLES)) u_sdram (
                 .clk        (clk),
                 .rst_n      (rst_n),
                 .addr       (mem_addr),
@@ -192,7 +265,8 @@ module memory_controller #(
                 .dram_cas_n (dram_cas_n),
                 .dram_we_n  (dram_we_n),
                 .dram_dqm   (dram_dqm),
-                .dram_clk   (dram_clk)
+                .dram_clk   (dram_clk),
+                .dram_clk_in (dram_clk_in)
             );
         end else begin : g_onchip
             // The fallback path has no SDRAM at all, so the extra requesters

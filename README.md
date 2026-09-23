@@ -81,18 +81,29 @@ $Q/quartus_pgm -m jtag -o "p;output_files/FPGA80186.sof@2"
 
 | | |
 |---|---|
-| Logic | 4,048 ALMs / 32,070 — **13%** |
-| Registers | 2,566 |
+| Logic | 6,170 ALMs / 32,070 — **19%** |
+| Registers | 5,493 |
 | Pins | 82 / 457 |
-| Block memory | 29 M10K — **7%** |
+| Block memory | 171 M10K — **43%** |
 | DSP | 2 (the multiplier) |
-| **PLLs** | **0** |
+| **PLLs** | **1** / 6 |
 | Worst slack | **positive at all four corners** |
-| Tightest setup | `DRAM_CLK`, +2.969 ns |
+| `clk_sys` (40 MHz) | +5.284 ns, Fmax 50.72 MHz |
+| `clk_vga` (25.185 MHz) | +27.746 ns |
+| Tightest setup | `DRAM_CLK`, **+0.429 ns** |
 
-That is the shipping configuration: disk in SDRAM sized for a 1.44 MB floppy,
-JTAG loader and ISMCE both enabled. Block RAM drops to 7% because the disk
-image no longer lives there.
+That is the shipping configuration: 16 MB disk in SDRAM, JTAG loader and ISMCE
+enabled, the 40 MHz PLL and the 8 KB cache. Block RAM is mostly the 64 KB mode
+13h framebuffer; the cache adds about nine M10K.
+
+`DRAM_CLK` is the tightest path in the design and always has been — raising the
+system clock from 25 to 40 MHz spent most of the margin the 90° phase shift
+bought. It is positive at all four corners with clock uncertainty applied, but
+it is the number to watch if anything else is ever added to the memory path.
+
+**One PLL, not three.** The fitter line says `1 / 6`, which is the check that
+matters: `altera_pll` instantiated by hand produced three PLL atoms that would
+have locked independently.
 
 The SDRAM interface is the tightest path, and both sides of it are packed into
 the I/O cells (`FAST_INPUT_REGISTER` on `DRAM_DQ`, `FAST_OUTPUT_REGISTER` on
@@ -129,7 +140,7 @@ assembler encoding tests, 38 filesystem tests and 15 disk-builder tests
 | `tb_halt` | `HLT` wake rules: IF set, IF clear, NMI, return address |
 | `tb_pic` | interrupt controller priority and masking |
 | `tb_timer` | the three counters |
-| `tb_keyboard` | PS/2 receive, scancode FIFO |
+| `tb_keyboard` | PS/2 receive, scancode FIFO, set 2 → set 1 translation |
 | `tb_iodecode` | the I/O bus contract, at **real BIU timing**, both byte lanes |
 | `tb_crtc` | 6845 cursor registers |
 | `tb_storage` | block device (ROM backend), and the FAT12 structures on it |
@@ -232,28 +243,105 @@ device strobe fires only in a cycle where `ready` is high.
 
 ---
 
-## Clocking — and why 25 MHz
+## The keyboard, and why translation had to be in hardware
 
-There is **no PLL**. `CLOCK_50` enters the chip and `clk_rst` divides it by
-two; that 25 MHz clock runs the CPU, the SDRAM and the video output alike.
+PS/2 keyboards power up sending **scancode set 2**. PC software expects **set
+1**, and on a real PC the 8042 converts between them. This design passed raw
+set 2 through to port 60h for a long time, with a note in
+`keyboard_controller.sv` saying that whether to translate there or in the BIOS
+was an open decision.
+
+It was not open. **DOOM8088 installs its own `INT 09h` and reads port 60h
+directly**, which is what any game that needs to know which keys are *held*
+must do — so the BIOS's translation never runs for exactly the software that
+matters. Translating in the BIOS would have fixed typing and nothing else.
+
+The symptom was not a dead keyboard. It was **keys that stuck down**, and the
+mechanism is worth remembering:
+
+- Set 2 marks a release as `F0 <code>`. Set 1 marks it by setting bit 7.
+- Software tests `code & 0x80`. `0xF0 & 0x80` is true — so it reads the
+  **release prefix itself** as a key-up, and then the real scancode that
+  follows as a fresh key-**down**.
+- Letting go of a key therefore registers as pressing it again.
+
+On top of that, none of the game's bindings landed: set 2 Ctrl `0x14` is set 1
+`T`, Alt `0x11` is `W`, Shift `0x12` is `E`, and the arrows (`E0 75` and
+friends) mapped to nothing at all.
+
+`keyboard_controller.sv` now translates on the way into the FIFO. The `E0`
+prefix passes straight through — set 1 uses it too, and the **same table
+applies to the byte after it**, so extended keys need no second table. `F0` is
+consumed and becomes bit 7 of the code that follows.
+
+**One table, two consumers.** `tools/scancodes.py` holds it, generates
+`rom/scancodes.svh` for the hardware, and is imported by `gen_bios.py` to build
+the BIOS's scancode-to-ASCII map. Two hand-written copies would drift, and the
+symptom of a drift looks like a broken keyboard rather than a mismatch.
+`sim/tb_keyboard.sv` asserts the specific mappings DOOM8088 depends on, by
+name, so a change that breaks the game's controls fails a test rather than
+being discovered by playing it.
+
+
+## Clocking — 25 MHz, then 40
+
+For most of this project there was **no PLL**: `CLOCK_50` entered the chip and
+`clk_rst` divided it by two, and that 25 MHz clock ran the CPU, the SDRAM and
+the video output alike. That is still what `USE_PLL = 0` builds, and what every
+simulation runs, so the history below is worth keeping.
 
 The CPU core itself closes timing at 50 MHz comfortably. What does not is the
-**SDRAM read capture**. `DRAM_CLK` is the inverted system clock driven out
-through the fabric to a pin, so it reaches the memory about 4.5 ns after the
+**SDRAM read capture**. `DRAM_CLK` was the inverted system clock driven out
+through the fabric to a pin, so it reached the memory about 4.5 ns after the
 internal clock edge; the chip then takes a further tAC (5.4 ns) to drive read
 data back. At a 20 ns period that put the data 2.4 ns *past* the capture edge
 — a genuine violation at all four timing corners, not a pessimistic model.
-
-A PLL would fix it by phase-shifting `DRAM_CLK` to cancel the output delay,
-which is exactly what Terasic's own SDRAM reference design does. Without one,
-halving the clock is the clean answer: at 40 ns the same edge lands deep inside
-the data valid window, with no change to the memory controller at all. The cost
-is cheap — a real 80186 ran at 6–12.5 MHz, so 25 MHz is still two to four times
-the original part.
+Halving the clock was the clean answer: at 40 ns the same edge lands deep
+inside the data valid window, with no change to the memory controller at all.
 
 25 MHz also happens to be what the video wants: nominal for 640x480 @ 60 Hz is
 25.175 MHz, so 25.000 is 0.7% slow and refresh lands near 59.5 Hz, well inside
 what any monitor tolerates.
+
+### The PLL
+
+`USE_PLL = 1` replaces the divider with `ip/sys_pll`, generated by Quartus's
+own IP tool (the exact `ip-generate` command is in `modules/pll.sv`), giving
+three clocks from one PLL:
+
+| output | rate | drives |
+|---|---|---|
+| `outclk_0` | 40 MHz | CPU, cache, SDRAM controller |
+| `outclk_1` | 25.185 MHz | the pixel clock, now independent |
+| `outclk_2` | 40 MHz, 90° late | `DRAM_CLK`, straight out to the memory |
+
+**The phase shift is the whole point.** Without a PLL the memory clock can only
+be at 0° or 180°, and 180° is what forced 25 MHz. A PLL puts it anywhere, and
+the two constraints pull opposite ways: later gives more command setup at the
+memory, earlier brings read data back sooner relative to the capture edge.
+Ninety degrees splits them — 6.25 ns of setup against a 1.5 ns requirement, and
+read data back around 18 ns into a 25 ns period.
+
+**It must be one PLL, not three.** `altera_pll` instantiated by hand with
+`number_of_clocks(3)` synthesises to three PLL atoms, and three PLLs lock
+independently — the 90° relationship between `clk_sys` and `clk_dram` would
+mean nothing. Going through the IP tool is what guarantees one VCO and one
+feedback path.
+
+**Everything rate-dependent derives from one constant.** `CLK_HZ` in
+`FPGA80186.sv` feeds the SDRAM refresh interval, the port 61h refresh toggle
+and the 8253's prescaler. Refresh is a *deadline*: overshoot it and memory
+corrupts silently, hours later, looking like anything but a clock change.
+
+The BIOS has a rate-dependent constant too — its timer divisor — and it lives
+in Python, in another file. `tools/gen_bios.py --clk-hz` writes the rate it
+used into `rom/clk.svh`, and `FPGA80186.sv` refuses to compile if that does not
+match its own `CLK_HZ`. The failure mode without that check is not a build
+error; it is every DOS program that measures time running at the wrong speed.
+
+With the PLL, `clk_vga` is a genuinely separate domain for the first time. The
+cursor and mode-select signals crossing into `vga_controller` are synchronised,
+and `FPGA80186.sdc` declares the domains asynchronous.
 
 **This was invisible until the SDRAM interface was constrained.** With no
 `set_input_delay` on `DRAM_DQ` the analyser reported no margin at all for that
@@ -280,7 +368,7 @@ are covered by `tools/test_asm86.py`.
 | `INT 11h` / `INT 12h` | equipment word, memory size |
 | `INT 1Ah` | 00 read tick count |
 | `INT 08h` | timer tick, chains to `INT 1Ch` |
-| `INT 09h` | keyboard: set 2 → ASCII into the buffer at 40:1E |
+| `INT 09h` | keyboard: set 1 → ASCII into the buffer at 40:1E |
 | `INT 19h` | bootstrap: load sector 0 to 0000:7C00, check AA55, jump |
 
 Two places it deviates from a PC, both forced by the hardware:
