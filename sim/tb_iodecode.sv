@@ -52,6 +52,7 @@ module tb_iodecode;
     logic [10:0] cursor_addr;
 
     logic        stor_sel, stor_rd, stor_wr;
+    logic        pic_eoi;
     logic [2:0]  stor_reg;
     logic [15:0] stor_wdata, stor_rdata;
 
@@ -67,7 +68,8 @@ module tb_iodecode;
         .crtc_wdata (crtc_wdata), .crtc_rdata (crtc_rdata),
         .stor_sel (stor_sel), .stor_reg (stor_reg),
         .stor_rd (stor_rd), .stor_wr (stor_wr),
-        .stor_wdata (stor_wdata), .stor_rdata (stor_rdata)
+        .stor_wdata (stor_wdata), .stor_rdata (stor_rdata),
+        .pic_eoi (pic_eoi)
     );
 
     crtc u_crtc (
@@ -205,6 +207,10 @@ module tb_iodecode;
     logic [15:0] d;
     logic [7:0]  b;
 
+    // pic_eoi is a one-cycle pulse; count edges rather than sampling it.
+    int eoi_pulses = 0;
+    always @(posedge clk) if (pic_eoi) eoi_pulses++;
+
     initial begin
         kbd_rd_pulses = 0;
         strobe_outside_ready = 0;
@@ -290,6 +296,36 @@ module tb_iodecode;
         bus_write_byte(16'h0061, 8'h00);
         bus_read_byte(16'h0061, b);
         chk("port 61h speaker bits cleared", b[1:0], 2'b00);
+
+        // ---- the 8259 shim at 20h/21h ----
+        // The pulse must be exactly one cycle and must only come from an OCW2
+        // with the EOI bit set: firing on every write to 20h would clear an
+        // in-service bit when software was only initialising the controller.
+        eoi_pulses = 0;
+        bus_write_byte(16'h0020, 8'h20);           // OCW2, non-specific EOI
+        chk("an EOI write pulses once", eoi_pulses, 1);
+
+        eoi_pulses = 0;
+        bus_write_byte(16'h0020, 8'h11);           // ICW1: bit 4 set, not an EOI
+        chk("ICW1 is not treated as an EOI", eoi_pulses, 0);
+
+        eoi_pulses = 0;
+        bus_write_byte(16'h0020, 8'h0B);           // OCW3, no EOI bit
+        chk("OCW3 is not treated as an EOI", eoi_pulses, 0);
+
+        eoi_pulses = 0;
+        bus_read_byte(16'h0020, b);
+        chk("reading the command port does not pulse", eoi_pulses, 0);
+
+        // The mask register is accepted and read back, but deliberately not
+        // acted on -- see the note in io_decode.sv.
+        bus_write_byte(16'h0021, 8'hFE);
+        bus_read_byte(16'h0021, b);
+        chk("the interrupt mask reads back", b, 8'hFE);
+
+        eoi_pulses = 0;
+        bus_write_byte(16'h0021, 8'h20);           // the EOI value, wrong port
+        chk("writing the mask port never pulses an EOI", eoi_pulses, 0);
 
         // ---- storage answers on its own ports, over the same bus ----
         // Proves the decode split works and that a second device on this bus

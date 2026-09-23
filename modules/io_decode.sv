@@ -85,6 +85,9 @@ module io_decode #(
     // Video mode, CGA-style: bit 1 selects graphics
     output logic        mode_gfx,
 
+    // 8259 shim: a one-cycle pulse when software ends an interrupt the PC way
+    output logic        pic_eoi,
+
     // blitter
     output logic        blit_sel,
     output logic [2:0]  blit_reg,     // (port - 0330h) >> 1
@@ -108,6 +111,8 @@ module io_decode #(
     localparam logic [15:0] PORT_DAC_IDX  = 16'h03C8;
     localparam logic [15:0] PORT_DAC_DATA = 16'h03C9;
     localparam logic [15:0] PORT_MODE     = 16'h03D8;
+    localparam logic [15:0] PORT_PIC_CMD  = 16'h0020;
+    localparam logic [15:0] PORT_PIC_MASK = 16'h0021;
 
     // Block storage occupies 0320-032F, the PC/XT hard-disk controller range.
     localparam logic [11:0] PORT_STOR_PAGE = 12'h032;
@@ -172,6 +177,27 @@ module io_decode #(
     assign hit_dac  = (io_addr == PORT_DAC_IDX) || (io_addr == PORT_DAC_DATA);
     assign dac_port = (io_addr == PORT_DAC_DATA);
 
+    // ---- 8259 shim at 20h/21h ----
+    // Not an 8259, and not pretending to be one. PC software ends an
+    // interrupt by writing OCW2 with the EOI bit to port 20h; this design's
+    // interrupts come from the 80186's own controller, which takes its EOI at
+    // FF22 instead. A guest that does it the PC way therefore leaves the
+    // in-service bit set forever and never receives another interrupt --
+    // including the timer, so its clock stops and it waits for time that
+    // never passes. Doom8088 hangs on a black screen for exactly that reason.
+    //
+    // So a write to 20h with the EOI bit set is turned into a pulse that
+    // clears the 80186 controller's highest-priority in-service bit, which is
+    // what its own EOI register does. The interrupt mask at 21h is accepted
+    // and read back but not acted on: ignoring a mask can only deliver
+    // interrupts a guest expected to be able to receive, which is the safe
+    // direction to be wrong in.
+    logic hit_pic_cmd, hit_pic_mask;
+    assign hit_pic_cmd  = (io_addr == PORT_PIC_CMD);
+    assign hit_pic_mask = (io_addr == PORT_PIC_MASK);
+
+    logic [7:0] pic_mask_r;
+
     logic hit_kbd, hit_stor, hit_crtc, hit_blit;
     assign hit_kbd  = (io_addr == PORT_KBD_DATA) || (io_addr == PORT_KBD_STAT);
     assign kbd_port = (io_addr == PORT_KBD_STAT);
@@ -219,6 +245,15 @@ module io_decode #(
         else if (hit_mode && io_wr && access_strobe) mode_gfx <= byte_wdata[1];
     end
 
+    // OCW2 bit 5 is the EOI request; bit 4 clear distinguishes OCW2 from ICW1.
+    assign pic_eoi = hit_pic_cmd && io_wr && access_strobe
+                     && byte_wdata[5] && !byte_wdata[4];
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)                                      pic_mask_r <= 8'h00;
+        else if (hit_pic_mask && io_wr && access_strobe) pic_mask_r <= byte_wdata;
+    end
+
     assign blit_sel   = hit_blit;
     assign blit_rd    = hit_blit && io_rd && access_strobe;
     assign blit_wr    = hit_blit && io_wr && access_strobe;
@@ -247,6 +282,10 @@ module io_decode #(
             rdata = stor_rdata;
         else if (hit_blit)
             rdata = blit_rdata;
+        else if (hit_pic_mask)
+            rdata = io_addr[0] ? {pic_mask_r, 8'h00} : {8'h00, pic_mask_r};
+        else if (hit_pic_cmd)
+            rdata = 16'h0000;
         else
             rdata = 16'hFFFF;
     end

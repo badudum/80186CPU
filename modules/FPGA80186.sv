@@ -128,6 +128,7 @@ module FPGA80186 #(
     logic [17:0] pal_rgb;
 
     // ---- blitter ----
+    logic        pic_eoi;
     logic        blit_sel, blit_rd, blit_wr, blit_we, blit_stall, blit_busy;
     logic [2:0]  blit_reg;
     logic [15:0] blit_wdata, blit_rdata, blit_fb_wdata, blit_fb_rdata;
@@ -179,6 +180,7 @@ module FPGA80186 #(
         .intr_type     (8'h00),
         .intr_ack      (),
         .halted        (halted),
+        .ext_eoi       (pic_eoi),
         .dbg_ip        (dbg_ip),
         .dbg_cs        (dbg_cs),
         .dbg_flags     (dbg_flags),
@@ -362,6 +364,7 @@ module FPGA80186 #(
         .dac_wdata  (dac_wdata),
         .dac_rdata  (dac_rdata),
         .mode_gfx   (mode_gfx),
+        .pic_eoi    (pic_eoi),
         .blit_sel   (blit_sel),
         .blit_reg   (blit_reg),
         .blit_rd    (blit_rd),

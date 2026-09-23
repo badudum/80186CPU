@@ -111,7 +111,7 @@ configuration and writes nothing into the working tree.
 ./sim/run.sh tb_alu       # a single module
 ```
 
-There are **27 testbenches totalling 776 checks**, all passing, plus 71
+There are **27 testbenches totalling 787 checks**, all passing, plus 71
 assembler encoding tests, 38 filesystem tests and 15 disk-builder tests
 (`python3 tools/test_asm86.py`, `tools/test_fat12.py`, `tools/test_mkdisk.py`):
 
@@ -719,6 +719,7 @@ I/O space:
 | Port | Device |
 |---|---|
 | `0060`, `0064` | PS/2 keyboard data and status |
+| `0020`, `0021` | 8259 shim: end-of-interrupt, and a mask that reads back |
 | `0061` | system control port: bit 4 is the DRAM refresh toggle |
 | `03C8`, `03C9` | VGA palette DAC: index, then red/green/blue |
 | `03D8` | video mode, CGA-style; bit 1 selects graphics |
@@ -781,11 +782,35 @@ conflicting pins, ports with no assignment, and the same pin used twice.
 - **The filesystem is read-only in practice.** `fat12.py` can create a volume
   and add files, and the boot sector can read one, but `INT 13h` has no write
   function, so nothing changes the disk at runtime.
-- **No PC-compatible peripherals beyond the essentials.** There is no 8259 at
-  20h/21h, no 8253 at 40h-43h and no 8237 at 00h-0Fh — this design uses the
-  80186's own integrated equivalents, at the 80186's own addresses. Port 61h
-  exists only far enough to keep timing-calibration loops running. Software
-  that programs those chips directly will not work.
+- **No PC-compatible peripherals beyond the essentials.** There is no 8253 at
+  40h-43h and no 8237 at 00h-0Fh — this design uses the 80186's own integrated
+  equivalents, at the 80186's own addresses. Port 61h exists only far enough to
+  keep timing-calibration loops running, and 20h/21h only far enough to accept
+  an end-of-interrupt (see below). Software that reprograms the PC timer for a
+  faster tick gets the 80186's 18.2 Hz instead, which makes it run very slowly
+  rather than not at all.
+
+### The 8259 shim, and why an absent chip stops the clock
+
+PC software ends an interrupt by writing OCW2 to **port 20h**. This design's
+interrupts come from the 80186's own controller, which takes its end-of-
+interrupt at `FF22`. A guest doing it the PC way therefore leaves the
+in-service bit set **forever**, and the controller never delivers another
+interrupt — the timer included. Its clock stops, and it waits for time that
+never passes.
+
+That is not hypothetical. Doom8088 sets mode 13h correctly, clears the screen
+and then hangs on black, spinning in a loop that subtracts two 32-bit time
+accumulators. The BIOS tick at `0040:006C` was frozen at `0x33` across half a
+minute while, at the DOS prompt, it advanced normally. `io_decode` now turns a
+write of OCW2-with-EOI into a pulse that clears the 80186 controller's
+highest-priority in-service bit, and the tick advances again.
+
+It fires only on OCW2 with the EOI bit set, not on every write to 20h:
+initialising a controller (ICW1) must not clear an in-service bit. The mask at
+21h is accepted and reads back but is deliberately not acted on — ignoring a
+mask can only deliver interrupts the guest expected to be able to receive,
+which is the safe direction to be wrong in.
 - **One graphics mode, and it is not VGA-register compatible.** Mode 13h
   works, set through `INT 10h` as every DOS program actually does it. Real
   VGA mode setting programs a dozen sequencer, CRTC and graphics-controller

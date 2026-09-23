@@ -71,6 +71,11 @@ module cpu_top
 
     // ---- status / debug ----
     output logic        halted,
+    // An end-of-interrupt issued to the 8259 shim at port 20h, which lives
+    // outside this module because a real 80186 board's PC-compatible glue
+    // would have been external too.
+    input  logic        ext_eoi,
+
     output logic [15:0] dbg_ip,
     output logic [15:0] dbg_cs,
     output logic [15:0] dbg_flags,
@@ -233,6 +238,7 @@ module cpu_top
     interrupt_controller u_pic (
         .clk         (clk),
         .rst_n       (rst_n),
+        .ext_eoi     (ext_eoi),
         .sel         (ic_sel),
         .pcb_off     (pcb_off),
         .pcb_wdata   (pcb_wdata),

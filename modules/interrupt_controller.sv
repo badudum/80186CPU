@@ -63,6 +63,13 @@ module interrupt_controller
     input  logic        pcb_re,
     output logic [15:0] pcb_rdata,
 
+    // A non-specific EOI issued from OUTSIDE the peripheral control block.
+    // PC software ends an interrupt by writing to an 8259 at port 20h, not to
+    // this controller's own register, and a guest that does so leaves the
+    // in-service bit set here forever -- which stops every later interrupt,
+    // including the timer. io_decode turns that write into this pulse.
+    input  logic        ext_eoi,
+
     // ---- external interrupt pins ----
     input  logic        int0,
     input  logic        int1,
@@ -229,6 +236,10 @@ module interrupt_controller
                     default: ;   // external pins are level-sensitive, nothing to clear
                 endcase
             end
+
+            // An EOI from the 8259 shim clears the same bit the controller's
+            // own EOI register would.
+            if (ext_eoi && eoi_valid) isr_r[eoi_target] <= 1'b0;
 
             // ---- register writes ----
             if (sel && pcb_we) begin

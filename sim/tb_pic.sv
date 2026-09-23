@@ -23,6 +23,7 @@ module tb_pic;
     logic        ready;
     logic        nmi = 0;
     logic        int0 = 0, int1 = 0, int2 = 0, int3 = 0;
+    logic        ext_eoi = 1'b0;
     logic        drq0 = 0, drq1 = 0;
     logic        intr_req = 0;
     logic [7:0]  intr_type = 8'h00;
@@ -144,6 +145,37 @@ module tb_pic;
 
         // in-service bit was cleared by the EOI the handler issued
         chk("EOI cleared in-service", dut.u_pic.isr_r, 7'h00);
+
+        // ---- an EOI arriving from the 8259 shim ----
+        // PC software ends an interrupt by writing port 20h, not this
+        // controller's own register. Without somewhere for that write to go,
+        // the in-service bit stays set and NOTHING is ever delivered again --
+        // the timer included, so a guest's clock stops and it waits for time
+        // that never comes. Force a bit in service and clear it the PC way.
+        @(negedge clk);
+        force dut.u_pic.isr_r = 7'b0001000;
+        @(negedge clk);
+        release dut.u_pic.isr_r;
+        chk("a bit is in service before the shim's EOI",
+            dut.u_pic.isr_r, 7'b0001000);
+
+        @(negedge clk);
+        ext_eoi = 1'b1;
+        @(negedge clk);
+        ext_eoi = 1'b0;
+        @(negedge clk);
+        chk("an EOI from port 20h cleared it", dut.u_pic.isr_r, 7'h00);
+
+        // ...and it must not clear anything when nothing is in service, nor
+        // disturb the mask.
+        @(negedge clk);
+        ext_eoi = 1'b1;
+        @(negedge clk);
+        ext_eoi = 1'b0;
+        @(negedge clk);
+        chk("a stray EOI with nothing in service is harmless",
+            dut.u_pic.isr_r, 7'h00);
+        chk("...and left the mask alone", dut.u_pic.mask_r, 7'h7F);
 
         $display("");
         $display("==================================");

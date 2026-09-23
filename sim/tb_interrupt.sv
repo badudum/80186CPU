@@ -24,6 +24,7 @@ module tb_interrupt;
     logic [7:0]  intr_type = 8'h00;
     logic        intr_ack;
     logic        int0 = 0, int1 = 0, int2 = 0, int3 = 0;
+    logic        ext_eoi = 1'b0;
     logic        drq0 = 0, drq1 = 0;
     logic        halted;
     logic [15:0] dbg_ip, dbg_cs, dbg_flags;
