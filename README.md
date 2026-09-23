@@ -112,8 +112,8 @@ configuration and writes nothing into the working tree.
 ```
 
 There are **26 testbenches totalling 757 checks**, all passing, plus 71
-assembler encoding tests and 32 filesystem tests (`python3 tools/test_asm86.py`,
-`python3 tools/test_fat12.py`):
+assembler encoding tests, 38 filesystem tests and 15 disk-builder tests
+(`python3 tools/test_asm86.py`, `tools/test_fat12.py`, `tools/test_mkdisk.py`):
 
 | Testbench | Covers |
 |---|---|
@@ -571,6 +571,47 @@ bitstream; MS-DOS is Microsoft's, so nothing from `ms-dos/` is committed here.
 Lower the JTAG clock as shown or the loader outruns the SDRAM writer — it will
 tell you if it does, and the readback check will fail rather than leaving a
 quietly corrupt disk.
+
+## Disks bigger than a floppy
+
+`tools/mkdisk.py` builds a large bootable image from a floppy plus whatever
+else you want on it:
+
+```sh
+python3 tools/mkdisk.py ms-dos/disk01.img big.img --size 16 GAME.EXE DATA.WAD
+```
+
+The disk lives in SDRAM and `storage.sv` takes any sector count, so 1.44 MB was
+never a hardware limit — it was the size of the image being loaded. Growing a
+FAT volume means rebuilding its BPB, FAT and root directory and relocating
+every file, which is what the tool does.
+
+**Sixteen megabytes is the ceiling**, and not arbitrarily: `storage.sv` forms
+its address as `BASE + {lba[14:0], 9'b0}`, and fifteen bits of sector number
+reaches exactly 32,768 sectors.
+
+Three things have to agree or the machine half-reads the disk:
+
+1. **The BIOS's geometry.** `INT 13h` converts CHS to LBA using the
+   sectors-per-track and heads it was *built* with, so a ROM built for a floppy
+   reads the wrong sectors. `tools/img2hex.py --sdram` writes `rom/geometry.py`
+   from the image and `gen_bios.py` picks it up.
+2. **`DISK_SECTORS`**, which is a synthesis parameter and so needs a rebuild.
+3. **The cylinder count.** This BIOS keeps the cylinder in `CH` alone — a real
+   BIOS puts bits 8–9 in `CL[7:6]` and we ignore them — so no more than 256
+   cylinders. 16 MB at floppy geometry would need 909; at 63 sectors × 16 heads
+   it needs 32. The tool refuses geometry that would overflow rather than
+   producing an image that silently reads the wrong tracks.
+
+Two details that produce a disk which looks perfect and does not boot, both
+handled: **`IO.SYS` must be the first root entry and `MSDOS.SYS` the second**,
+because the MS-DOS boot sector compares those two slots by position rather than
+searching; and **FAT12 has only 4084 usable cluster numbers**, so past about
+2 MB the clusters have to grow rather than multiply.
+
+Not yet run on hardware — whether MS-DOS is happy booting from a 16 MB volume
+with hard-disk geometry on what it is told is drive 0 is the open question. The
+image itself round-trips byte for byte in `tools/test_mkdisk.py`.
 
 ## Putting your own disk image on it
 

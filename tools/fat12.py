@@ -50,9 +50,17 @@ def _name_to_83(name):
 
 
 class Fat12:
+    # FAT12 stores cluster numbers in twelve bits, and the values from FF0 up
+    # are reserved as end-of-chain and bad-cluster markers. A volume with more
+    # than 4084 usable clusters is therefore not FAT12 at all, whatever the
+    # BPB says, and DOS will read it as FAT16 and see garbage. Bigger volumes
+    # need bigger clusters, not more of them.
+    MAX_CLUSTERS = 4084
+
     def __init__(self, total_sectors, sectors_per_track, heads,
                  root_entries=112, media=0xF8, label="FPGA80186",
-                 oem="FPGA8018", serial=0x80186FA7):
+                 oem="FPGA8018", serial=0x80186FA7,
+                 sectors_per_cluster=1):
         if total_sectors < 16:
             raise Fat12Error("volume too small to hold a filesystem")
         if root_entries % (SECTOR // DIR_ENTRY):
@@ -69,7 +77,10 @@ class Fat12:
 
         self.reserved = 1
         self.num_fats = 2
-        self.sectors_per_cluster = 1
+        if sectors_per_cluster not in (1, 2, 4, 8, 16, 32, 64):
+            raise Fat12Error("sectors per cluster must be a power of two, 1..64")
+        self.sectors_per_cluster = sectors_per_cluster
+        self.cluster_bytes = SECTOR * sectors_per_cluster
 
         self.root_sectors = (root_entries * DIR_ENTRY) // SECTOR
 
@@ -96,6 +107,12 @@ class Fat12:
                            + self.root_sectors)
         self.cluster_count = ((total_sectors - self.data_start)
                               // self.sectors_per_cluster)
+        if self.cluster_count > self.MAX_CLUSTERS:
+            raise Fat12Error(
+                "%d clusters exceeds the FAT12 limit of %d; use "
+                "sectors_per_cluster=%d or more"
+                % (self.cluster_count, self.MAX_CLUSTERS,
+                   sectors_per_cluster * 2))
         if self.cluster_count >= 4085:
             raise Fat12Error("too many clusters for FAT12 (%d)" % self.cluster_count)
 
@@ -124,15 +141,15 @@ class Fat12:
         if len(self.dirents) >= self.root_entries:
             raise Fat12Error("root directory is full")
 
-        need = max(1, (len(data) + SECTOR - 1) // SECTOR)
+        need = max(1, (len(data) + self.cluster_bytes - 1) // self.cluster_bytes)
         if self.next_free + need > self.cluster_count + 2:
             raise Fat12Error("no room for %s (%d sectors)" % (name, need))
 
         first = self.next_free
         for i in range(need):
             c = first + i
-            chunk = data[i * SECTOR:(i + 1) * SECTOR]
-            self.clusters[c] = chunk.ljust(SECTOR, b"\0")
+            chunk = data[i * self.cluster_bytes:(i + 1) * self.cluster_bytes]
+            self.clusters[c] = chunk.ljust(self.cluster_bytes, b"\0")
             # Chain to the next cluster, or mark the end of the file.
             self.fat[c] = (c + 1) if i + 1 < need else 0xFFF
         self.next_free += need
@@ -206,7 +223,7 @@ class Fat12:
 
         for c, data in self.clusters.items():
             lba = self.data_start + (c - 2) * self.sectors_per_cluster
-            img[lba * SECTOR:(lba + 1) * SECTOR] = data
+            img[lba * SECTOR:lba * SECTOR + len(data)] = data
 
         return bytes(img)
 

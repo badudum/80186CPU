@@ -236,6 +236,43 @@ def duplicate():
 
 expect_error("the same name twice", duplicate)
 
+
+# ---- multi-sector clusters, which is what a volume bigger than a floppy
+# ---- needs: FAT12 has only 4084 usable cluster numbers, so past about 2 MB
+# ---- the clusters have to grow rather than multiply.
+big = Fat12(32768, 63, 16, root_entries=512, sectors_per_cluster=16)
+chk("BPB reports the cluster size", big.image()[13], 16)
+chk("16 MB volume stays inside the FAT12 cluster limit",
+    big.cluster_count <= Fat12.MAX_CLUSTERS, True)
+
+payload = bytes((i * 7 + 3) & 0xFF for i in range(40000))    # ~5 clusters
+first = big.add_file("BIG.BIN", payload)
+img = big.image()
+start = (big.data_start + (first - 2) * big.sectors_per_cluster) * 512
+chk("a file spanning several clusters is laid down whole",
+    img[start:start + len(payload)], payload)
+
+# ...and the chain that describes it must be walkable, not merely present.
+fat = img[big.reserved * 512: big.reserved * 512 + big.sectors_per_fat * 512]
+def fat_entry(c):
+    o = (c * 3) // 2
+    v = fat[o] | (fat[o + 1] << 8)
+    return (v >> 4) if (c & 1) else (v & 0xFFF)
+
+chain, c = [], first
+while 2 <= c < 0xFF0 and len(chain) < 100:
+    chain.append(c)
+    c = fat_entry(c)
+chk("the cluster chain has the right length",
+    len(chain), (len(payload) + big.cluster_bytes - 1) // big.cluster_bytes)
+chk("the chain ends with an end-of-file marker", c >= 0xFF8, True)
+
+def too_many_clusters():
+    Fat12(32768, 63, 16, sectors_per_cluster=1)
+
+expect_error("a volume with more clusters than FAT12 can number",
+             too_many_clusters)
+
 print()
 print("=" * 46)
 print(" fat12: %d checks, %d failed" % (count, fails))
