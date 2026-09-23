@@ -119,6 +119,7 @@ module tb_bios;
         // load-bearing here rather than decorative.
         i = 0;
         while (!dut.halted && i < 8000000) begin @(negedge CLOCK_50); i++; end
+        $display("  boot to the keyboard wait: %0d CLOCK_50 cycles", i);
         chk("machine reached the keyboard wait", dut.halted, 1'b1);
 
         // "hello" in PS/2 scancode set 2. Nothing is forced: these are real

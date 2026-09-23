@@ -84,6 +84,7 @@ module tb_sdram;
 
     logic [15:0] d;
     int i, before_refresh;
+    int hit_min, miss_min;
 
     initial begin
         repeat (4) @(negedge clk);
@@ -149,6 +150,45 @@ module tb_sdram;
         // ...and data survives them
         do_read(20'h00100, d);
         chk("data survived refresh", d, 16'h1234);
+
+        // ---- the open row must actually save time ----
+        // Correctness tests pass whether or not the row stays open, so
+        // without this the optimisation could quietly stop working and
+        // nothing would notice. Minimums over several attempts, because a
+        // refresh landing inside one measurement inflates it.
+        hit_min  = 9999;
+        miss_min = 9999;
+        for (i = 0; i < 8; i++) begin
+            do_read(20'h00000, d);                // may miss; opens the row
+            do_read(20'h00002, d);                // same row: hit
+            if (cycles < hit_min) hit_min = cycles;
+            do_read(20'h00800, d);                // a different row: miss
+            if (cycles < miss_min) miss_min = cycles;
+        end
+        $display("  read cost: %0d clocks on a page hit, %0d on a miss",
+                 hit_min, miss_min);
+        checks++;
+        if (!(hit_min < miss_min)) begin
+            $display("FAIL a page hit (%0d) is not cheaper than a miss (%0d)",
+                     hit_min, miss_min);
+            errors++;
+        end
+
+        // A hit skips ACTIVATE, tRCD and tRP -- around five clocks at these
+        // timings. Requiring a clear margin rather than merely "faster"
+        // catches a hit path that has silently grown the work back.
+        checks++;
+        if (!(miss_min - hit_min >= 3)) begin
+            $display("FAIL page hit saves only %0d clocks, expected 3 or more",
+                     miss_min - hit_min);
+            errors++;
+        end
+
+        // The row must be reopened correctly after a refresh closes it.
+        do_write(20'h00300, 16'hC0DE, 2'b11);
+        repeat (400) @(negedge clk);              // long enough for a refresh
+        do_read(20'h00300, d);
+        chk("data readable after the row was closed by refresh", d, 16'hC0DE);
 
         // ---- the model saw no protocol violations ----
         chk("no SDRAM protocol errors", chip.errors, 0);

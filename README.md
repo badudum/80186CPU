@@ -111,7 +111,7 @@ configuration and writes nothing into the working tree.
 ./sim/run.sh tb_alu       # a single module
 ```
 
-There are **26 testbenches totalling 754 checks**, all passing, plus 71
+There are **26 testbenches totalling 757 checks**, all passing, plus 71
 assembler encoding tests and 32 filesystem tests (`python3 tools/test_asm86.py`,
 `python3 tools/test_fat12.py`):
 
@@ -390,10 +390,9 @@ device. 16 MB of the chip's 64 still fits inside bank 0.
 Three pieces:
 
 - **`modules/framebuffer.sv`** — 64 KB of on-chip dual-port RAM at `A0000`.
-  On-chip is the whole point. Scanning 320x200 out at 60 Hz needs 3.84 MB/s
-  and the SDRAM controller delivers about 3.3 MB/s, because it bursts one word
-  at a time and auto-precharges every access. Display alone would consume more
-  than the memory system has, before the CPU fetched an instruction. Here
+  On-chip is the whole point. Scanning 320x200 out at 60 Hz needs 3.84 MB/s,
+  which is the same order as everything the SDRAM controller can deliver even
+  with the open-row policy below. Display alone would crowd out the CPU. Here
   scan-out costs the rest of the machine nothing: it is a second port on a
   block RAM nobody else touches. The price is 50 of 397 M10K blocks.
 - **`modules/vga_dac.sv`** — the 256-entry palette, written through ports
@@ -424,6 +423,44 @@ afternoon here, with the board booting far enough to print six lines and then
 quietly not switching video mode, because the ROM in the bitstream predated the
 mode-13h code. `tools/gen_bios.py` now writes both files together, so they
 cannot get out of step.
+
+## The SDRAM controller keeps the row open
+
+A row is 1024 columns of 16 bits -- 2 KB -- and it stays ACTIVE after an
+access rather than being closed by auto-precharge. A second access to the same
+row then costs only the column command and the CAS latency, skipping
+ACTIVATE, tRCD and tRP:
+
+| | miss | page hit |
+|---|---|---|
+| read | 10 clocks | **5** |
+| write | 10 clocks | **3** |
+
+Instruction fetch, stack traffic and block copies all walk consecutive
+addresses, so most accesses hit. Measured on the sequential case that matters
+most, reading disk sectors out of SDRAM, it is **1.77x faster** -- 42,194
+clocks down to 23,781 for the same work.
+
+The whole-machine figure is much smaller: booting to the keyboard wait went
+from 3,451,369 clocks to 3,285,789, about **5%**. That is not a disappointment,
+it is where the time goes. The BIOS executes from on-chip ROM and writes to an
+on-chip text buffer, so most of that boot never touches SDRAM at all. The gain
+lands on code running from conventional memory -- which is to say on DOS and
+everything above it.
+
+Two things to know:
+
+- **The row is closed only when it must be**: a different row, or a refresh,
+  which requires every bank precharged. A miss costs exactly what the old
+  unconditional auto-precharge cost, so the floor is unchanged.
+- **Interleaving two streams in different rows makes every access a miss**, so
+  the arbiter's rotating priority can thrash the row when the CPU and the
+  block device run together. Per-bank row tracking would fix that; `bank` is
+  currently hardwired to zero.
+
+Correctness tests pass whether or not the row stays open, so `tb_sdram`
+measures the cost of a hit and a miss and fails if a hit is not at least three
+clocks cheaper. Without that the optimisation could quietly stop working.
 
 ## Two disk backends
 

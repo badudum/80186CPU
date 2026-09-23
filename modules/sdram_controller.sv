@@ -31,13 +31,21 @@
 // at 25 MHz the same edge sits deep inside the data valid window. See the
 // header of clk_rst.sv for the full derivation.
 //
-// EVERY ACCESS USES AUTO-PRECHARGE (A10 high during READ/WRITE). That means
-// no open-row tracking and no page-hit optimisation: each access is a full
-// ACTIVATE / READ-or-WRITE / precharge cycle, roughly ten clocks. It is
-// several times slower than a row-hit-optimised controller would be, and it
-// does not matter here -- the CPU issues one access at a time and stalls on
-// READY, so the only cost is a handful of wait states on an already slow bus.
-// Simplicity is worth far more than throughput at this stage.
+// OPEN-ROW POLICY. A row is 1024 columns of 16 bits -- 2 KB -- and it stays
+// ACTIVE after an access instead of being closed by auto-precharge. A second
+// access to the same row then costs only the column command and the CAS
+// latency, skipping ACTIVATE, tRCD and tRP entirely. Since instruction fetch,
+// stack traffic and block copies all walk consecutive addresses, most accesses
+// hit the open row:
+//
+//   read   11 clocks -> 6 on a hit      write  10 clocks -> 3 on a hit
+//
+// The row is closed only when it has to be: a different row, or a refresh,
+// which requires every bank precharged. The cost is the bookkeeping below and
+// one hazard worth naming -- interleaving two streams in different rows makes
+// every access a miss, so the arbiter's rotating priority can thrash the row
+// when the CPU and the block device run together. A miss is no slower than the
+// old unconditional auto-precharge, so the floor is unchanged.
 //
 // REFRESH runs on its own counter and takes priority over requests. Missing
 // refresh does not fail loudly -- it silently corrupts memory in a way that
@@ -115,6 +123,7 @@ module sdram_controller #(
     localparam logic [3:0] S_WRITE    = 4'd10;
     localparam logic [3:0] S_RECOVER  = 4'd11;
     localparam logic [3:0] S_REFRESH  = 4'd12;
+    localparam logic [3:0] S_PRE      = 4'd13;
 
     logic [3:0]  state, next_after_wait;
     logic [15:0] delay;
@@ -125,6 +134,7 @@ module sdram_controller #(
 
     logic [15:0] refresh_cnt;
     logic        refresh_due;
+
 
     // ---- address split ----
     // Word address, then column / bank / row. Sequential CPU accesses walk the
@@ -147,6 +157,12 @@ module sdram_controller #(
 
     assign {dram_cs_n, dram_ras_n, dram_cas_n, dram_we_n} = cmd;
     assign dram_ba   = bank;
+    // ---- the open row ----
+    // `bank` is fixed at zero, so one row is all there is to track.
+    logic        row_open;
+    logic [12:0] open_row;
+    logic        page_hit;
+    assign page_hit = row_open && (row == open_row);
     assign dram_cke  = 1'b1;
     assign dram_clk  = ~clk;
     assign dram_dq   = dq_oe ? dq_out : 16'hzzzz;
@@ -178,6 +194,8 @@ module sdram_controller #(
             xfer_be         <= 2'b11;
             is_write        <= 1'b0;
             refresh_cnt     <= 16'h0000;
+            row_open        <= 1'b0;
+            open_row        <= 13'h0000;
         end else begin
             cmd   <= CMD_NOP;
             ready <= 1'b0;
@@ -229,17 +247,46 @@ module sdram_controller #(
                 // ---- normal operation ----
                 S_IDLE: begin
                     // Refresh outranks a pending access. A request waits a few
-                    // clocks; a missed refresh corrupts memory silently.
+                    // clocks; a missed refresh corrupts memory silently. Every
+                    // bank must be precharged before a refresh, so an open row
+                    // is closed first.
                     if (refresh_due) begin
-                        state <= S_REFRESH;
+                        if (row_open) begin
+                            cmd             <= CMD_PRECHARGE;
+                            dram_addr       <= 13'h0400;   // A10: all banks
+                            row_open        <= 1'b0;
+                            delay           <= 16'd1;      // tRP
+                            next_after_wait <= S_REFRESH;
+                            state           <= S_WAIT;
+                        end else begin
+                            state <= S_REFRESH;
+                        end
                     end else if (rd || wr) begin
-                        is_write  <= wr;
-                        xfer_be   <= be;
-                        dram_addr <= row;
-                        cmd       <= CMD_ACTIVE;
-                        state     <= S_RCD;
-                        delay     <= 16'd1;            // tRCD
+                        is_write <= wr;
+                        xfer_be  <= be;
+                        if (page_hit) begin
+                            // The row is already active: straight to the column.
+                            state <= wr ? S_WRITE : S_READ;
+                        end else if (row_open) begin
+                            cmd             <= CMD_PRECHARGE;
+                            dram_addr       <= 13'h0400;
+                            row_open        <= 1'b0;
+                            delay           <= 16'd1;      // tRP
+                            next_after_wait <= S_ACTIVE;
+                            state           <= S_WAIT;
+                        end else begin
+                            state <= S_ACTIVE;
+                        end
                     end
+                end
+
+                S_ACTIVE: begin
+                    cmd       <= CMD_ACTIVE;
+                    dram_addr <= row;
+                    open_row  <= row;
+                    row_open  <= 1'b1;
+                    delay     <= 16'd1;                    // tRCD
+                    state     <= S_RCD;
                 end
 
                 S_RCD: begin
@@ -248,10 +295,10 @@ module sdram_controller #(
                 end
 
                 S_READ: begin
-                    // A10 high selects auto-precharge, so the row closes
-                    // itself once the access finishes.
+                    // A10 LOW: no auto-precharge, so the row stays active for
+                    // whatever comes next.
                     cmd       <= CMD_READ;
-                    dram_addr <= {2'b00, 1'b1, col};
+                    dram_addr <= {2'b00, 1'b0, col};
                     delay     <= CAS_LATENCY[15:0];
                     state     <= S_READ_W;
                 end
@@ -260,7 +307,10 @@ module sdram_controller #(
                     if (delay == 16'd0) begin
                         rdata <= dram_dq;
                         ready <= 1'b1;
-                        delay <= 16'd2;                // tRP after auto-precharge
+                        // No precharge to wait for. One cycle of recovery so a
+                        // requester that has not yet seen `ready` cannot be
+                        // served twice.
+                        delay <= 16'd0;
                         state <= S_RECOVER;
                     end else begin
                         delay <= delay - 16'd1;
@@ -270,11 +320,13 @@ module sdram_controller #(
                 S_WRITE: begin
                     cmd       <= CMD_WRITE;
                     dqm_r     <= ~xfer_be;
-                    dram_addr <= {2'b00, 1'b1, col};
+                    dram_addr <= {2'b00, 1'b0, col};   // A10 low: row stays open
                     dq_out    <= wdata;
                     dq_oe     <= 1'b1;
                     ready     <= 1'b1;
-                    delay     <= 16'd4;                // tWR + tRP
+                    // tWR only. At 40 ns a clock one cycle covers it several
+                    // times over, and there is no precharge to wait for.
+                    delay     <= 16'd0;
                     state     <= S_RECOVER;
                 end
 
