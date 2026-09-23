@@ -56,6 +56,8 @@ B_PAGE = 0x62         # byte   active page
 B_TICKS = 0x6C        # dword  timer ticks since midnight
 # Private scratch, above everything the PC BIOS defines.
 B_MODEHW = 0x80       # byte   port 3D8 read straight back after a mode set
+B_MODEREQ = 0x81      # byte   the AL of the most recent INT 10h AH=00
+B_MODECNT = 0x82      # byte   how many AH=00 calls have been made
 B_FAULT = 0x90        # 42 bytes: the register state at the last trap
 B_PROFI = 0xBC        # byte   next slot in the profile ring
 B_PROF  = 0xC0        # PROF_N entries of CS:IP, sampled by the timer tick
@@ -299,6 +301,16 @@ a.jmp("i10_done")
 a.label("i10_not_tty")
 a.cmp(AH, 0x00)
 a.jnz("i10_not_mode")
+# Record what was asked for, and that it was asked at all. A guest whose
+# picture never appears might be requesting a mode this BIOS does not
+# implement, or might not be going through the BIOS at all -- and those two
+# need completely different fixes.
+a.mov(mem(disp=B_MODEREQ), AL)
+a.push(AX)
+a.mov(AL, mem(disp=B_MODECNT))
+a.inc(AL)
+a.mov(mem(disp=B_MODECNT), AL)
+a.pop(AX)
 # AL is the mode number. 13h is 320x200 in 256 colours; anything else is
 # treated as the text mode, which is what a BIOS with one of each should do
 # rather than failing on a mode it does not have.

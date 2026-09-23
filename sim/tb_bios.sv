@@ -208,6 +208,10 @@ module tb_bios;
         // controller scans, so this covers INT 10h mode 13h, the A0000
         // decode, the byte lanes and the 3C8/3C9 DAC in one go.
         chk("mode register selected graphics", dut.mode_gfx, 1'b1);
+        // ...and the BIOS's read-back of port 3D8 must agree with it. The BDA
+        // mode byte is only the BIOS's opinion; this is the hardware's.
+        chk("BIOS read the mode register back as graphics",
+            chip.mem['h480 >> 1][7:0], 8'h02);
         chk("kernel plotted pixel (0,0)",   dut.u_mem.u_fb.ram_lo[0], 8'h01);
         chk("kernel plotted pixel (1,0)",   dut.u_mem.u_fb.ram_hi[0], 8'h02);
         // 199*320 + 319 = 63999, an odd offset, so it lands in the high lane
