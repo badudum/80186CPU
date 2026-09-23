@@ -55,6 +55,7 @@ B_CURSOR = 0x50       # word   low = column, high = row
 B_PAGE = 0x62         # byte   active page
 B_TICKS = 0x6C        # dword  timer ticks since midnight
 # Private scratch, above everything the PC BIOS defines.
+B_MODEHW = 0x80       # byte   port 3D8 read straight back after a mode set
 B_FAULT = 0x90        # 42 bytes: the register state at the last trap
 B_PROFI = 0xBC        # byte   next slot in the profile ring
 B_PROF  = 0xC0        # PROF_N entries of CS:IP, sampled by the timer tick
@@ -277,6 +278,7 @@ a.sti()
 a.mov_label(SI, "banner")
 a.call("puts")
 
+
 a.int_(0x19)                  # bootstrap; does not return
 a.hlt()
 
@@ -307,15 +309,23 @@ a.mov(mem(disp=B_MODE), AL)       # remember 13h before AL is reused
 a.mov(DX, P_MODE)
 a.mov(AL, 0x02)                   # bit 1: graphics
 a.out_dx(AL)
+a.in_dx(AL)                       # ...and read it back, see B_MODEHW
+a.mov(mem(disp=B_MODEHW), AL)
 a.call("clear_gfx")
 a.mov(AX, 0x0000)
 a.mov(mem(disp=B_CURSOR), AX)
 a.jmp("i10_done")
 
+# B_MODEHW records what port 3D8 reads back immediately after the write. The
+# BDA's mode byte is only the BIOS's opinion; this is what the video hardware
+# is actually doing, and the two disagreeing is precisely the failure worth
+# being able to see.
 a.label("i10_mode_text")
 a.mov(DX, P_MODE)
 a.mov(AL, 0x00)
 a.out_dx(AL)
+a.in_dx(AL)
+a.mov(mem(disp=B_MODEHW), AL)
 a.call("clear_screen")
 a.mov(AX, 0x0000)
 a.mov(mem(disp=B_CURSOR), AX)

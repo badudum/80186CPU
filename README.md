@@ -320,6 +320,15 @@ pads the image so `KERNEL.BIN` straddles a head *and* a cylinder boundary, and
 the boot sector deliberately does **not** save `BX` across `INT 13h`, so both
 paths are exercised on every run.
 
+### Telling the video hardware from the BIOS's opinion of it
+
+`INT 10h` records the mode it set in the BDA at `0040:0049`, but that is only
+the BIOS's *opinion*. After each mode set it now also reads port `03D8` back
+and stores it at `0040:0080`, so `tools/jtag_peek.tcl 0x000480` says what the
+video hardware is actually doing. The two disagreeing is exactly the failure
+worth being able to see, and distinguishing "the mode never took" from "the
+mode took and the picture is wrong" otherwise needs somebody at a monitor.
+
 ### Finding a fault inside a guest
 
 `INT 06h` writes the whole machine state to `0040:0090` before it halts — every
