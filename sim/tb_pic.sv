@@ -24,6 +24,7 @@ module tb_pic;
     logic        nmi = 0;
     logic        int0 = 0, int1 = 0, int2 = 0, int3 = 0;
     logic        ext_eoi = 1'b0;
+    logic        ext_tick = 1'b0, ext_tick_en = 1'b0;
     logic        drq0 = 0, drq1 = 0;
     logic        intr_req = 0;
     logic [7:0]  intr_type = 8'h00;

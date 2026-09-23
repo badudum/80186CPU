@@ -81,6 +81,7 @@ case "$TB" in
                             "$REPO/modules/sdram_controller.sv"
                             "$REPO/sim/sdram_model.sv") ;;
     tb_storage)        RTL=("$PKG" "$REPO/modules/storage.sv") ;;
+    tb_pit)            RTL=("$PKG" "$REPO/modules/pit8253.sv") ;;
     tb_blitter)        RTL=("$PKG" "$REPO/modules/blitter.sv" "$REPO/modules/framebuffer.sv") ;;
     tb_vga)            RTL=("$PKG" "$REPO/modules/vga_controller.sv" "$REPO/modules/font_rom.sv" "$REPO/modules/vga_dac.sv") ;;
     tb_sdram)          RTL=("$PKG" "$REPO/modules/sdram_controller.sv" "$REPO/sim/sdram_model.sv") ;;
@@ -103,6 +104,7 @@ case "$TB" in
                             "$REPO/modules/framebuffer.sv"
                             "$REPO/modules/vga_dac.sv"
                             "$REPO/modules/blitter.sv"
+                            "$REPO/modules/pit8253.sv"
                             "$REPO/modules/bios_rom.sv"
                             "$REPO/modules/memory_controller.sv"
                             "$REPO/modules/io_decode.sv"
@@ -121,6 +123,7 @@ case "$TB" in
                             "$REPO/modules/framebuffer.sv"
                             "$REPO/modules/vga_dac.sv"
                             "$REPO/modules/blitter.sv"
+                            "$REPO/modules/pit8253.sv"
                             "$REPO/modules/bios_rom.sv"
                             "$REPO/modules/sdram_controller.sv"
                             "$REPO/modules/sdram_arbiter.sv"

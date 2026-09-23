@@ -76,6 +76,13 @@ module cpu_top
     // would have been external too.
     input  logic        ext_eoi,
 
+    // A timer interrupt from the PC-compatible 8253. Once software has
+    // programmed that chip it OWNS the tick, because it reprogrammed the rate
+    // and is counting on getting it; until then the 80186's own timer drives
+    // the interrupt exactly as before.
+    input  logic        ext_tick,
+    input  logic        ext_tick_en,
+
     output logic [15:0] dbg_ip,
     output logic [15:0] dbg_cs,
     output logic [15:0] dbg_flags,
@@ -249,7 +256,7 @@ module cpu_top
         .int1        (int1),
         .int2        (int2),
         .int3        (int3),
-        .timer0_irq  (timer0_irq),
+        .timer0_irq  (ext_tick_en ? ext_tick : timer0_irq),
         .timer1_irq  (timer1_irq),
         .timer2_irq  (timer2_irq),
         .dma0_irq    (dma0_irq),

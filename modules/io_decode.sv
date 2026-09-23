@@ -88,6 +88,14 @@ module io_decode #(
     // 8259 shim: a one-cycle pulse when software ends an interrupt the PC way
     output logic        pic_eoi,
 
+    // 8253 programmable interval timer at 40h-43h
+    output logic        pit_sel,
+    output logic [1:0]  pit_port,
+    output logic        pit_rd,
+    output logic        pit_wr,
+    output logic [7:0]  pit_wdata,
+    input  logic [7:0]  pit_rdata,
+
     // blitter
     output logic        blit_sel,
     output logic [2:0]  blit_reg,     // (port - 0330h) >> 1
@@ -113,6 +121,7 @@ module io_decode #(
     localparam logic [15:0] PORT_MODE     = 16'h03D8;
     localparam logic [15:0] PORT_PIC_CMD  = 16'h0020;
     localparam logic [15:0] PORT_PIC_MASK = 16'h0021;
+    localparam logic [13:0] PORT_PIT_PAGE  = 14'h0010;   // 0040-0043
 
     // Block storage occupies 0320-032F, the PC/XT hard-disk controller range.
     localparam logic [11:0] PORT_STOR_PAGE = 12'h032;
@@ -192,6 +201,10 @@ module io_decode #(
     // and read back but not acted on: ignoring a mask can only deliver
     // interrupts a guest expected to be able to receive, which is the safe
     // direction to be wrong in.
+    logic hit_pit;
+    assign hit_pit  = (io_addr[15:2] == PORT_PIT_PAGE);
+    assign pit_port = io_addr[1:0];
+
     logic hit_pic_cmd, hit_pic_mask;
     assign hit_pic_cmd  = (io_addr == PORT_PIC_CMD);
     assign hit_pic_mask = (io_addr == PORT_PIC_MASK);
@@ -254,6 +267,11 @@ module io_decode #(
         else if (hit_pic_mask && io_wr && access_strobe) pic_mask_r <= byte_wdata;
     end
 
+    assign pit_sel   = hit_pit;
+    assign pit_rd    = hit_pit && io_rd && access_strobe;
+    assign pit_wr    = hit_pit && io_wr && access_strobe;
+    assign pit_wdata = byte_wdata;
+
     assign blit_sel   = hit_blit;
     assign blit_rd    = hit_blit && io_rd && access_strobe;
     assign blit_wr    = hit_blit && io_wr && access_strobe;
@@ -282,6 +300,8 @@ module io_decode #(
             rdata = stor_rdata;
         else if (hit_blit)
             rdata = blit_rdata;
+        else if (hit_pit)
+            rdata = io_addr[0] ? {pit_rdata, 8'h00} : {8'h00, pit_rdata};
         else if (hit_pic_mask)
             rdata = io_addr[0] ? {pic_mask_r, 8'h00} : {8'h00, pic_mask_r};
         else if (hit_pic_cmd)

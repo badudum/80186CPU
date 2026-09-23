@@ -29,6 +29,7 @@ module tb_string;
     logic        halted;
     logic [15:0] dbg_ip, dbg_cs, dbg_flags;
     logic        ext_eoi = 1'b0;   // the 8259 shim's EOI; unused here
+    logic        ext_tick = 1'b0, ext_tick_en = 1'b0;
     logic [7:0]  dbg_int_type;
     logic        dbg_int_taken;
 

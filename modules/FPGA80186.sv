@@ -28,6 +28,7 @@
 //   +- vga_controller    640x480 text mode, or 320x200x8 graphics
 //   +- vga_dac           the 256-colour palette behind mode 13h
 //   +- blitter           rectangle fill and copy in the framebuffer
+//   +- pit8253           the PC's interval timer, for guests that want it
 //      +- font_rom       8x16 glyphs
 //
 // BUS ROUTING: the CPU's memory and I/O address spaces are separate and
@@ -129,6 +130,9 @@ module FPGA80186 #(
 
     // ---- blitter ----
     logic        pic_eoi;
+    logic        pit_sel, pit_rd, pit_wr, pit_irq0, pit_ch0_programmed;
+    logic [1:0]  pit_port;
+    logic [7:0]  pit_wdata, pit_rdata;
     logic        blit_sel, blit_rd, blit_wr, blit_we, blit_stall, blit_busy;
     logic [2:0]  blit_reg;
     logic [15:0] blit_wdata, blit_rdata, blit_fb_wdata, blit_fb_rdata;
@@ -181,6 +185,8 @@ module FPGA80186 #(
         .intr_ack      (),
         .halted        (halted),
         .ext_eoi       (pic_eoi),
+        .ext_tick      (pit_irq0),
+        .ext_tick_en   (pit_ch0_programmed),
         .dbg_ip        (dbg_ip),
         .dbg_cs        (dbg_cs),
         .dbg_flags     (dbg_flags),
@@ -308,6 +314,19 @@ module FPGA80186 #(
     logic [2:0]  stor_reg;
     logic [15:0] stor_wdata, stor_rdata;
 
+    pit8253 u_pit (
+        .clk            (clk_cpu),
+        .rst_n          (rst_n),
+        .sel            (pit_sel),
+        .port           (pit_port),
+        .rd             (pit_rd),
+        .wr             (pit_wr),
+        .wdata          (pit_wdata),
+        .rdata          (pit_rdata),
+        .irq0           (pit_irq0),
+        .ch0_programmed (pit_ch0_programmed)
+    );
+
     blitter u_blit (
         .clk       (clk_cpu),
         .rst_n     (rst_n),
@@ -365,6 +384,12 @@ module FPGA80186 #(
         .dac_rdata  (dac_rdata),
         .mode_gfx   (mode_gfx),
         .pic_eoi    (pic_eoi),
+        .pit_sel    (pit_sel),
+        .pit_port   (pit_port),
+        .pit_rd     (pit_rd),
+        .pit_wr     (pit_wr),
+        .pit_wdata  (pit_wdata),
+        .pit_rdata  (pit_rdata),
         .blit_sel   (blit_sel),
         .blit_reg   (blit_reg),
         .blit_rd    (blit_rd),

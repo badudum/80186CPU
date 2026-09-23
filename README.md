@@ -111,7 +111,7 @@ configuration and writes nothing into the working tree.
 ./sim/run.sh tb_alu       # a single module
 ```
 
-There are **27 testbenches totalling 787 checks**, all passing, plus 71
+There are **28 testbenches totalling 795 checks**, all passing, plus 71
 assembler encoding tests, 38 filesystem tests and 15 disk-builder tests
 (`python3 tools/test_asm86.py`, `tools/test_fat12.py`, `tools/test_mkdisk.py`):
 
@@ -720,6 +720,7 @@ I/O space:
 |---|---|
 | `0060`, `0064` | PS/2 keyboard data and status |
 | `0020`, `0021` | 8259 shim: end-of-interrupt, and a mask that reads back |
+| `0040`–`0043` | 8253 interval timer; channel 0 drives the tick once programmed |
 | `0061` | system control port: bit 4 is the DRAM refresh toggle |
 | `03C8`, `03C9` | VGA palette DAC: index, then red/green/blue |
 | `03D8` | video mode, CGA-style; bit 1 selects graphics |
@@ -782,13 +783,30 @@ conflicting pins, ports with no assignment, and the same pin used twice.
 - **The filesystem is read-only in practice.** `fat12.py` can create a volume
   and add files, and the boot sector can read one, but `INT 13h` has no write
   function, so nothing changes the disk at runtime.
-- **No PC-compatible peripherals beyond the essentials.** There is no 8253 at
-  40h-43h and no 8237 at 00h-0Fh — this design uses the 80186's own integrated
-  equivalents, at the 80186's own addresses. Port 61h exists only far enough to
-  keep timing-calibration loops running, and 20h/21h only far enough to accept
-  an end-of-interrupt (see below). Software that reprograms the PC timer for a
-  faster tick gets the 80186's 18.2 Hz instead, which makes it run very slowly
-  rather than not at all.
+- **No PC-compatible DMA.** There is no 8237 at 00h-0Fh; this design uses the
+  80186's own integrated controller at its own addresses. The 8259 and 8253
+  now have shims (below), but they are shims, not the chips: no BCD counting,
+  no 8254 read-back command, no specific EOI, and the interrupt mask at 21h is
+  accepted without being acted on.
+
+### The 8253, and why the rate is the whole point
+
+Software that reprograms channel 0 is counting its own interrupts to keep
+time. Giving it a tick at the wrong frequency does not break it — it makes it
+run at the ratio between the rate it asked for and the rate it got. Doom8088
+asks for about 140 Hz; on the 80186's own 18.2 Hz timer it advanced roughly a
+frame every two seconds.
+
+So channel 0 is a real counter, and **once software programs it, it takes over
+the timer interrupt** from the 80186's timer. Until then nothing changes, so
+software that never touches 40h-43h keeps exactly the behaviour it had. The
+input clock is 1.193182 MHz on a PC; at 25 MHz the nearest integer divisor is
+21, giving 1.190 MHz — 0.25% slow.
+
+`tb_pit` measures the interval between pulses rather than checking that
+something pulsed, and asserts that halving the divisor halves it. A timer with
+a fixed rate passes every "did it tick" check ever written; forcing one fails
+two of these.
 
 ### The 8259 shim, and why an absent chip stops the clock
 
