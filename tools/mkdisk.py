@@ -13,8 +13,23 @@ WHY NOT JUST COPY THE FLOPPY AND MAKE IT BIGGER. A FAT volume's size is baked
 into its BPB, its FAT length and its root directory. Growing one means
 rebuilding all three and relocating every file, which is what this does.
 
-THREE CONSTRAINTS, none obvious, all of which produce a disk that looks right
-and does not boot:
+MS-DOS DOES NOT ALWAYS BELIEVE THE BPB. For a floppy it picks a device
+parameter table from the media descriptor and the format it recognises, and
+uses that instead. Two fields have to match what DOS expects or it computes a
+different data area from the one the volume actually has, reads the wrong
+clusters, and reports "Bad or missing Command Interpreter" -- after booting
+perfectly, because the boot sector and IO.SYS do read the BPB:
+
+  * THE MEDIA DESCRIPTOR. F0 is a floppy and F8 a fixed disk, and they are not
+    interchangeable: building a 16 MB volume with F8 got as far as IO.SYS and
+    then jumped into zeroed memory. Both default to the source's byte now.
+
+  * THE ROOT DIRECTORY SIZE. Measured: the same 2880-sector image at the same
+    geometry with the same media boots COMMAND.COM with 224 root entries and
+    fails with 512. Nothing else changed. Defaults to the source's count.
+
+THREE MORE CONSTRAINTS, none obvious, all of which produce a disk that looks
+right and does not boot:
 
   * IO.SYS MUST BE THE FIRST ROOT ENTRY AND MSDOS.SYS THE SECOND. The MS-DOS
     boot sector does not search the directory -- it compares entry 0 against
@@ -115,11 +130,11 @@ def read_fat12(img):
     return out
 
 
-def pick_cluster_size(total_sectors, root_entries):
+def pick_cluster_size(total_sectors, root_entries, spt, heads):
     """Smallest cluster that keeps the volume inside FAT12's 4084 numbers."""
     for spc in (1, 2, 4, 8, 16, 32, 64):
         try:
-            Fat12(total_sectors, 63, 16, root_entries=root_entries,
+            Fat12(total_sectors, spt, heads, root_entries=root_entries,
                   sectors_per_cluster=spc)
             return spc
         except Fat12Error:
@@ -134,13 +149,23 @@ def main():
     ap.add_argument("source", help="a bootable MS-DOS floppy image")
     ap.add_argument("output", help="the image to write")
     ap.add_argument("--size", type=int, default=16, help="megabytes (default 16)")
+    ap.add_argument("--sectors", type=int, default=None,
+                    help="exact sector count, overriding --size (floppy sizes "
+                         "are not whole megabytes)")
+    ap.add_argument("--media", type=lambda v: int(v, 0), default=None,
+                    help="media descriptor byte; defaults to the source's. DOS "
+                         "picks a device parameter set from this, and F0 "
+                         "(floppy) and F8 (fixed disk) are not interchangeable")
     ap.add_argument("--spt", type=int, default=63, help="sectors per track")
     ap.add_argument("--heads", type=int, default=16, help="heads")
-    ap.add_argument("--root-entries", type=int, default=512)
+    ap.add_argument("--root-entries", type=int, default=None,
+                    help="root directory size; defaults to the source's. "
+                         "MS-DOS does not always believe the BPB here -- see "
+                         "the note above")
     ap.add_argument("add", nargs="*", help="extra files to place on the volume")
     args = ap.parse_args()
 
-    total_sectors = args.size * 1024 * 1024 // SECTOR
+    total_sectors = args.sectors or (args.size * 1024 * 1024 // SECTOR)
     cylinders = total_sectors // (args.spt * args.heads)
     if cylinders > MAX_CYLINDERS:
         ap.error("%d MB at %d sectors x %d heads needs %d cylinders; this "
@@ -149,6 +174,9 @@ def main():
                  % (args.size, args.spt, args.heads, cylinders, MAX_CYLINDERS))
 
     src = open(args.source, "rb").read()
+    media = args.media if args.media is not None else src[21]
+    root_entries = (args.root_entries if args.root_entries is not None
+                    else struct.unpack_from("<H", src, 17)[0])
     if src[510:512] != b"\x55\xaa":
         ap.error("%s has no boot signature; it is not a bootable image"
                  % args.source)
@@ -160,12 +188,13 @@ def main():
             ap.error("%s has no %s, so nothing built from it would boot"
                      % (args.source, required))
 
-    spc = pick_cluster_size(total_sectors, args.root_entries)
+    spc = pick_cluster_size(total_sectors, root_entries,
+                            args.spt, args.heads)
     # Carry the source's OEM name across rather than stamping our own. It is
     # what SYS.COM does, and some DOS versions look at it.
     fs = Fat12(total_sectors, args.spt, args.heads,
-               root_entries=args.root_entries, sectors_per_cluster=spc,
-               oem=src[3:11].decode("latin1"))
+               root_entries=root_entries, sectors_per_cluster=spc,
+               oem=src[3:11].decode("latin1"), media=media)
 
     # The boot sector's code, with this volume's BPB. Bytes 0-2 are the jump
     # and 62 onwards is the loader; everything between is the BPB that fat12.py
@@ -190,8 +219,8 @@ def main():
 
     used = sum(1 for c in range(2, fs.cluster_count + 2) if fs.fat[c])
     print(fs.describe())
-    print("geometry : %d cylinders x %d heads x %d sectors"
-          % (cylinders, args.heads, args.spt))
+    print("geometry : %d cylinders x %d heads x %d sectors, media %02X"
+          % (cylinders, args.heads, args.spt, media))
     print("clusters : %d of %d bytes, %d used, %.1f MB free"
           % (fs.cluster_count, fs.cluster_bytes, used,
              (fs.cluster_count - used) * fs.cluster_bytes / 1048576.0))
@@ -201,8 +230,8 @@ def main():
     for path in args.add:
         print("   %-13s %8d" % (os.path.basename(path).upper(),
                                 os.path.getsize(path)))
-    print("wrote %s: %d sectors (%d MB)"
-          % (args.output, total_sectors, args.size))
+    print("wrote %s: %d sectors (%.2f MB)"
+          % (args.output, total_sectors, total_sectors * SECTOR / 1048576.0))
 
 
 if __name__ == "__main__":

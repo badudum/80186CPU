@@ -609,9 +609,26 @@ because the MS-DOS boot sector compares those two slots by position rather than
 searching; and **FAT12 has only 4084 usable cluster numbers**, so past about
 2 MB the clusters have to grow rather than multiply.
 
-Not yet run on hardware — whether MS-DOS is happy booting from a 16 MB volume
-with hard-disk geometry on what it is told is drive 0 is the open question. The
-image itself round-trips byte for byte in `tools/test_mkdisk.py`.
+**MS-DOS does not always believe the BPB.** For a floppy it picks a device
+parameter table from the media descriptor and the format it recognises, and
+uses that instead — so two fields have to match what DOS expects or it computes
+a different data area from the one the volume has, reads the wrong clusters,
+and reports `Bad or missing Command Interpreter`. That happens *after* booting
+perfectly, because the boot sector and `IO.SYS` do read the BPB. Both are
+measured, not guessed:
+
+- **The media descriptor.** `F0` is a floppy, `F8` a fixed disk. A 16 MB volume
+  built with `F8` got as far as `IO.SYS` and then jumped into zeroed memory.
+- **The root directory size.** The same 2880-sector image, same geometry, same
+  media, boots COMMAND.COM with 224 root entries and fails with 512. Nothing
+  else changed.
+
+Both now default to the source image's values, which is why the tool takes a
+floppy to copy from rather than building a volume from nothing.
+
+**Verified on hardware:** a 16 MB image holding all 45 files from the MS-DOS
+floppy plus a 693 KB executable and an 11 MB data file boots MS-DOS 6.22 to its
+prompt, with 3.1 MB free.
 
 ## Putting your own disk image on it
 

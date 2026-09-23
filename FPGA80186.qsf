@@ -294,10 +294,16 @@ set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to DRAM_UDQM
 set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
 set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
 set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
-# Disk in SDRAM, sized for a 1.44 MB floppy, filled by tools/jtag_load.tcl.
-# The image is volatile: the board does nothing until a load has run.
+# Disk in SDRAM, filled by tools/jtag_load.tcl. The image is volatile: the
+# board does nothing until a load has run.
+#
+# 32,768 sectors is 16 MB, which is the ceiling: storage.sv forms its address
+# as BASE + {lba[14:0], 9'b0}, and fifteen bits of sector number reaches
+# exactly that. A smaller image on a larger device is fine -- DOS reads the
+# size from the BPB, not from here -- so this does not have to track the image.
+# The BIOS's INT 13h geometry DOES have to: see rom/geometry.py.
 set_parameter -name DISK_IN_SDRAM 1
-set_parameter -name DISK_SECTORS 2880
+set_parameter -name DISK_SECTORS 32768
 
 # Make the BIOS and font ROMs rewritable over JTAG with the In-System Memory
 # Content Editor -- see tools/ismce_load.tcl. Costs nothing but the .mif files.
