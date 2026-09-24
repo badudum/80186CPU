@@ -352,6 +352,35 @@ module execUnit
     // below overrides it with the whole instruction's length.
     logic       fetch_pop;
 
+    // ---- early fetch redirect ----
+    // A taken branch costs far more than the redirect state it goes through.
+    // Measured on the BIOS workload, 48.5% of all FETCH_OP cycles are the
+    // sequencer holding with an EMPTY queue, and 98% of those are within a
+    // few cycles of a flush: the queue was thrown away by a branch and the
+    // execution unit is waiting for the first byte at the target to come
+    // back from memory. That is about 6% of every cycle the machine runs.
+    //
+    // For an UNCONDITIONAL near jump or call the target is known well before
+    // the branch retires -- rel_target is just ip_next + imm_r, and both are
+    // final by S_PREP. Starting the fetch there rather than at S_REDIRECT
+    // gives the memory three extra cycles of head start, and needs no
+    // prediction and cannot mispredict, because the branch is taken by
+    // definition. Conditional branches are NOT included: those need the
+    // flags, and guessing is a separate piece of work with its own recovery
+    // path.
+    //
+    // early_fetch records that it happened, so S_REDIRECT does not flush a
+    // second time and throw away the bytes that have just been fetched.
+    // Target of a relative branch. Declared here rather than beside its
+    // original use because the early-redirect path below needs it too.
+    logic [15:0] rel_target;
+    assign rel_target = ip_next + imm_r;
+
+    logic early_fetch;
+    logic early_jump_ok;
+    assign early_jump_ok = (iclass == C_JMP_SHORT) || (iclass == C_JMP_NEAR)
+                        || (iclass == C_CALL_NEAR);
+
 
     logic       fetch_is_seg_ovr, fetch_is_rep, fetch_is_lock, fetch_is_prefix;
     logic [1:0] fetch_seg;
@@ -906,8 +935,16 @@ module execUnit
                 flags_wdata = flags_val_r;
             end
 
-            S_REDIRECT: begin
+            S_PREP: if (early_jump_ok) begin
+                // Every instruction byte has been consumed by now, so
+                // flushing the queue here cannot lose any of this
+                // instruction.
                 fetch_set  = 1'b1;
+                fetch_addr = ({4'h0, cs} << 4) + {4'h0, rel_target};
+            end
+
+            S_REDIRECT: begin
+                fetch_set  = !early_fetch;
                 fetch_addr = ({4'h0, cs} << 4) + {4'h0, jump_target};
                 // Keep the architectural IP mirror correct. Far returns and
                 // IRET reach here without passing through S_RETIRE, so without
@@ -1062,8 +1099,6 @@ module execUnit
     // =====================================================================
     // Sequencer
     // =====================================================================
-    logic [15:0] rel_target;
-    assign rel_target = ip_next + imm_r;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -1102,6 +1137,7 @@ module execUnit
             seq_far      <= 1'b0;
             block_int_once <= 1'b0;
             prefix_seen  <= 1'b0;
+            early_fetch  <= 1'b0;
             seg_ovr_en   <= 1'b0;
             seg_ovr      <= SR_DS;
             rep_en       <= 1'b0;
@@ -1318,6 +1354,7 @@ module execUnit
 
                 // ---------- latch operands that are not the ModR/M source ----
                 S_PREP: begin
+                    if (early_jump_ok) early_fetch <= 1'b1;
                     reg_val  <= rd0_data;
                     acc_val  <= rd0_data;
                     sreg_val <= sreg_rd_data;
@@ -1941,6 +1978,7 @@ module execUnit
                 S_RETIRE: state <= do_jump ? S_REDIRECT : S_FETCH_OP;
 
                 S_REDIRECT: begin
+                    early_fetch <= 1'b0;
                     ip_next <= jump_target;
                     state   <= S_FETCH_OP;
                 end
