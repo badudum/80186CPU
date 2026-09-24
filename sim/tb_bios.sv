@@ -106,6 +106,9 @@ module tb_bios;
     // is the direct cost of the queue being empty, as opposed to the count
     // of instructions that merely started that way.
     int fetch_starved = 0, fetch_total = 0, starved_after_flush = 0;
+    // Is the whole-instruction capture actually being taken?
+    int fast_hits = 0, fetch_entries = 0;
+    int blk_prefix = 0, blk_int = 0, blk_invalid = 0;
     int flush_age = 999;
     logic flushed_recently;
     assign flushed_recently = (flush_age < 12);
@@ -142,6 +145,14 @@ module tb_bios;
         end
         if (dut.u_cpu.u_eu.u_exec.state == ST_FETCH_OP && !dut.halted) begin
             fetch_total++;
+            if (dl_prev != ST_FETCH_OP) begin
+                fetch_entries++;
+                if (dut.u_cpu.u_eu.u_exec.fast_take) fast_hits++;
+                else if (dut.u_cpu.u_eu.u_exec.prefix_seen)   blk_prefix++;
+                else if (dut.u_cpu.u_eu.u_exec.hw_int_ready ||
+                         dut.u_cpu.u_eu.u_exec.block_int_once) blk_int++;
+                else if (!dl_valid)                            blk_invalid++;
+            end
             if (dut.u_cpu.u_biu.u_pq.count == 0) begin
                 fetch_starved++;
                 if (flushed_recently) starved_after_flush++;
@@ -506,6 +517,8 @@ module tb_bios;
         $display("");
         $display("  decode_len shadow: %0d checked, %0d mismatched, %0d unknowable",
                  dl_checked, dl_mismatch, dl_unknown);
+        $display("  fast path: %0d of %0d entries took it; blocked by prefix %0d, interrupt %0d, not queued %0d",
+                 fast_hits, fetch_entries, blk_prefix, blk_int, blk_invalid);
         $display("  FETCH_OP: %0d cycles, %0d of them with an empty queue (%0.1f%%), %0d just after a flush",
                  fetch_total, fetch_starved,
                  100.0 * fetch_starved / fetch_total, starved_after_flush);

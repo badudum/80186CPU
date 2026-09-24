@@ -52,7 +52,20 @@ module decode_len
     output logic [2:0]  op_imm_bytes,
     output logic        has_rep,
     output logic        has_seg_ovr,
-    output logic [1:0]  seg_ovr
+    output logic [1:0]  seg_ovr,
+
+    // The instruction's fields, assembled from the queue. Extracting them
+    // here rather than in the sequencer keeps the byte offsets in one place,
+    // next to the length calculation that defines them -- the two have to
+    // agree, and a second copy of the offset arithmetic is exactly the kind
+    // of thing that drifts.
+    output logic        rm_is_mem,
+    output logic        rep_z,        // F3 (REPE) rather than F2 (REPNE)
+    output logic [7:0]  op_byte_o,    // the opcode, past any prefixes
+    output logic [7:0]  modrm_byte_o,
+    output logic [15:0] disp,
+    output logic [15:0] imm,
+    output logic [15:0] imm2      // ptr16:16 segment half
 );
 
     // ---- prefixes ----
@@ -168,6 +181,51 @@ module decode_len
     // A caller that pops on "known" would run past the tail.
     assign op_has_modrm = d_has_modrm;
     assign op_imm_bytes = d_imm_bytes;
+    assign rm_is_mem    = d_rm_mem;
+    assign op_byte_o    = op_byte;
+    assign modrm_byte_o = modrm_byte;
+
+    // REPE and REPNE differ only in which way the string comparison exits.
+    // The last repeat prefix wins, as with segment overrides.
+    always_comb begin
+        rep_z = 1'b0;
+        for (int i = 0; i < MAXPFX; i++)
+            if (is_rep[i]) rep_z = (peek[i] == 8'hF3);
+    end
+
+    // ---- field extraction ----
+    // Offsets follow the same layout the length is built from: prefixes,
+    // opcode, ModR/M, displacement, immediate.
+    logic [3:0] disp_at, imm_at;
+    assign disp_at = {1'b0, n_prefix} + 4'd1 + (d_has_modrm ? 4'd1 : 4'd0);
+    assign imm_at  = disp_at + {2'b0, eff_disp};
+
+    function automatic logic [7:0] at(input logic [3:0] i);
+        at = (i > 4'd5) ? 8'h00 : peek[i[2:0]];
+    endfunction
+
+    always_comb begin
+        // A one-byte displacement is SIGNED; a two-byte one is taken whole.
+        case (eff_disp)
+            2'd1:    disp = {{8{at(disp_at)[7]}}, at(disp_at)};
+            2'd2:    disp = {at(disp_at + 4'd1), at(disp_at)};
+            default: disp = 16'h0000;
+        endcase
+
+        // imm_sext is the same distinction for immediates: an 8-bit
+        // immediate on a 16-bit operation is sign-extended.
+        case (d_imm_bytes)
+            3'd1:    imm = d_sext ? {{8{at(imm_at)[7]}}, at(imm_at)}
+                                  : {8'h00, at(imm_at)};
+            3'd2,
+            3'd4:    imm = {at(imm_at + 4'd1), at(imm_at)};
+            default: imm = 16'h0000;
+        endcase
+
+        // Only the ptr16:16 forms have a second immediate.
+        imm2 = (d_imm_bytes == 3'd4)
+                 ? {at(imm_at + 4'd3), at(imm_at + 4'd2)} : 16'h0000;
+    end
 
     assign valid = (count >= need_for_len) && (count >= total) && (total <= 4'd6);
     assign len   = total[2:0];

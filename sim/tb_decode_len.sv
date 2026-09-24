@@ -15,8 +15,11 @@ module tb_decode_len;
     logic [3:0] count;
     logic       valid;
     logic [2:0] len, n_prefix;
-    logic       op_has_modrm;
+    logic       op_has_modrm, rm_is_mem;
     logic [2:0] op_imm_bytes;
+    logic [15:0] disp, imm, imm2;
+    logic        rep_z;
+    logic [7:0]  op_byte_o, modrm_byte_o;
     logic       has_rep, has_seg_ovr;
     logic [1:0] seg_ovr;
 
@@ -121,6 +124,15 @@ module tb_decode_len;
         chk("SS: segment is SS",        seg_ovr, 2);   // SR_SS
         chk("SS: no rep",               has_rep, 0);
 
+        put(2, 'hF3, 'hA5, 0, 0, 0, 0);                // REP MOVSW
+        chk("F3 is REPE",  rep_z, 1);
+        chk("opcode past the prefix", op_byte_o, 8'hA5);
+        put(2, 'hF2, 'hAE, 0, 0, 0, 0);                // REPNE SCASB
+        chk("F2 is REPNE", rep_z, 0);
+        put(3, 'h26, 'h8B, 'h07, 0, 0, 0);             // ES: MOV AX,[BX]
+        chk("opcode past a segment override", op_byte_o, 8'h8B);
+        chk("ModR/M after that opcode", modrm_byte_o, 8'h07);
+
         // A byte that merely looks like a prefix in the middle of an
         // instruction is not one: the scan must stop at the first non-prefix.
         put(3, 'h8B, 'hF3, 'hA5, 0, 0, 0);             // MOV SI,BX
@@ -147,6 +159,35 @@ module tb_decode_len;
 
         put(0, 0, 0, 0, 0, 0, 0);
         chk("empty queue -> not valid", valid, 0);
+
+        // ---- the assembled fields, not just the length ----
+        // The sequencer will take these directly, so the byte offsets and
+        // the sign extension have to be right as well as the length.
+        put(4, 'h8B,'h47,'hFC,0,0,0);           // MOV AX,[BX-4]
+        chk("disp8 is sign-extended", disp, 16'hFFFC);
+        put(4, 'h8B,'h47,'h04,0,0,0);           // MOV AX,[BX+4]
+        chk("positive disp8", disp, 16'h0004);
+        put(4, 'h8B,'h87,'h34,'h12,0,0);        // MOV AX,[BX+1234]
+        chk("disp16 little-endian", disp, 16'h1234);
+        put(3, 'hB8,'h34,'h12,0,0,0);           // MOV AX,1234
+        chk("imm16 little-endian", imm, 16'h1234);
+        put(2, 'hB0,'h80,0,0,0,0);              // MOV AL,80 -- no sign extend
+        chk("imm8 into a byte op is not extended", imm, 16'h0080);
+        put(3, 'h83,'hC0,'hFF,0,0,0);           // ADD AX,-1 (sign-extended)
+        chk("imm8 sign-extended for a word op", imm, 16'hFFFF);
+        put(5, 'hC7,'h47,'h04,'h34,'h12,0);     // MOV [BX+4],1234
+        chk("displacement and immediate together: disp", disp, 16'h0004);
+        chk("...and the immediate after it", imm, 16'h1234);
+        put(6, 'h81,'h87,'h34,'h12,'h78,'h56);  // ADD [BX+1234],5678
+        chk("disp16 then imm16: disp", disp, 16'h1234);
+        chk("disp16 then imm16: imm",  imm,  16'h5678);
+        put(5, 'hEA,'h00,'h10,'h00,'hF0,0);     // JMP FAR F000:1000
+        chk("far pointer offset", imm, 16'h1000);
+        chk("far pointer segment", imm2, 16'hF000);
+        put(2, 'h8B,'hC3,0,0,0,0);              // MOV AX,BX (register form)
+        chk("register operand is not memory", rm_is_mem, 0);
+        put(2, 'h8B,'h07,0,0,0,0);              // MOV AX,[BX]
+        chk("memory operand is memory", rm_is_mem, 1);
 
         // ---- the encodings the shadow run flagged ----
         $display("  probe: opcode -> has_modrm disp_bytes imm_bytes len");

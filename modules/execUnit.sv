@@ -332,8 +332,11 @@ module execUnit
     logic       dl_rep, dl_segovr_en;
     logic [1:0] dl_segovr;
 
-    logic       dl_has_modrm;
-    logic [2:0] dl_imm_bytes;
+    logic        dl_has_modrm;
+    logic [2:0]  dl_imm_bytes;
+    logic        dl_rm_mem, dl_rep_z;
+    logic [15:0] dl_disp, dl_imm, dl_imm2;
+    logic [7:0]  dl_op, dl_modrm;
 
     decode_len u_dlen (
         .peek         (fetch_peek),
@@ -345,8 +348,39 @@ module execUnit
         .op_imm_bytes (dl_imm_bytes),
         .has_rep      (dl_rep),
         .has_seg_ovr  (dl_segovr_en),
-        .seg_ovr      (dl_segovr)
+        .seg_ovr      (dl_segovr),
+        .rm_is_mem    (dl_rm_mem),
+        .rep_z        (dl_rep_z),
+        .op_byte_o    (dl_op),
+        .modrm_byte_o (dl_modrm),
+        .disp         (dl_disp),
+        .imm          (dl_imm),
+        .imm2         (dl_imm2)
     );
+
+    // ---- taking a whole instruction in one cycle ----
+    // The four states that read an instruction in -- opcode, ModR/M,
+    // displacement, immediate -- cost 20.4% of all cycles between them, and
+    // most of that is spent reading bytes that are already in the queue.
+    // When decode_len says the entire instruction is present, all of it is
+    // captured at once and the sequencer goes straight to the work.
+    //
+    // The guards matter more than the speed-up:
+    //
+    //   prefix_seen: if the byte-at-a-time path has already started scanning
+    //   prefixes, the queue head is mid-instruction and decode_len's view of
+    //   it is not the instruction being assembled. Let that one finish the
+    //   old way.
+    //
+    //   hw_int_ready / block_int_once: an interrupt is only accepted at an
+    //   instruction boundary, and taking this path commits to the
+    //   instruction. The existing priority has to be preserved exactly or
+    //   interrupts get accepted one instruction late, which is the sort of
+    //   thing that shows up as a hang under load and nowhere else.
+    logic fast_take;
+    assign fast_take = (state == S_FETCH_OP) && dl_valid
+                       && !prefix_seen && !block_int_once && !hw_int_ready;
+
 
     // The byte-at-a-time path still drives a single-byte pop; the fast path
     // below overrides it with the whole instruction's length.
@@ -529,7 +563,9 @@ module execUnit
     assign imm_take2 = (state == S_IMM) && (imm_idx == 2'd0)
                        && (imm_last == 2'd1) && (fetch_count >= 4'd2);
 
-    assign fetch_pop_n = imm_take2 ? 3'd2 : (fetch_pop ? 3'd1 : 3'd0);
+    assign fetch_pop_n = fast_take ? dl_len
+                       : imm_take2 ? 3'd2
+                       : (fetch_pop ? 3'd1 : 3'd0);
 
     logic is_muldiv, is_grp3_test;
     assign is_muldiv    = (alu_op == ALU_MUL) || (alu_op == ALU_IMUL) ||
@@ -1222,7 +1258,21 @@ module execUnit
                     // opcode arrives. An interrupt may not be accepted between
                     // a prefix and its instruction, so the check below is
                     // skipped once any prefix has been seen.
-                    if (fetch_valid && fetch_is_prefix) begin
+                    if (fast_take) begin
+                        opcode_r       <= dl_op;
+                        modrm_r        <= dl_modrm;
+                        disp_r         <= dl_disp;
+                        imm_r          <= dl_imm;
+                        imm2_r         <= dl_imm2;
+                        seg_ovr_en     <= dl_segovr_en;
+                        seg_ovr        <= dl_segovr;
+                        rep_en         <= dl_rep;
+                        rep_z          <= dl_rep_z;
+                        instr_start_ip <= ip_next;
+                        ip_next        <= ip_next + {13'd0, dl_len};
+                        prefix_seen    <= 1'b0;
+                        state          <= dl_rm_mem ? S_EA : S_PREP;
+                    end else if (fetch_valid && fetch_is_prefix) begin
                         ip_next     <= ip_next + 16'd1;
                         prefix_seen <= 1'b1;
                         if (fetch_is_seg_ovr) begin
