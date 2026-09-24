@@ -439,6 +439,77 @@ def build_kernel():
     a.mov(DX, W_CHS_DX)
     a.int_(0x13)
 
+    # ---- teletype output at the bottom of the screen must SCROLL ----
+    # The BIOS's own newline path calls the scroll routine, and that routine
+    # takes its window and line count in registers -- so the caller has to
+    # fill them in. It did not, and nothing noticed, because no test ever put
+    # the cursor on the last row. Output there overwrote the bottom line
+    # instead of scrolling. This is the check that would have caught it.
+    a.mov(AX, 0xB800)
+    a.mov(ES, AX)
+    a.mov(DI, 24 * 160)                  # a marker on the last row
+    a.mov(AX, 0x0751)                    # 'Q'
+    a.cld()
+    a.stosw()                            # ES:DI -- mem(DI) would be DS
+
+    a.mov(AH, 0x02)                      # cursor to the last row
+    a.mov(BH, 0)
+    a.mov(DX, 0x184F)                    # row 24, column 79
+    a.int_(0x10)
+
+    a.mov(AH, 0x0E)                      # a newline, which must scroll
+    a.mov(AL, 0x0D)
+    a.mov(BL, 0x07)
+    a.int_(0x10)
+    a.mov(AH, 0x0E)
+    a.mov(AL, 0x0A)
+    a.mov(BL, 0x07)
+    a.int_(0x10)
+
+    # ---- INT 10h AH=06: window blank and scroll ----
+    # AL=0 means BLANK THE WINDOW, not "scroll nothing", and the window is
+    # the rectangle in CX/DX rather than the whole screen. The old
+    # implementation ignored all of it and scrolled one line, so CLS left
+    # most of the display untouched. Rows 10 and up are used because the
+    # testbench checks the text above them.
+    a.mov(AX, 0xB800)
+    a.mov(ES, AX)
+    a.cld()
+
+    a.mov(DI, 10 * 160)                  # rows 10..14 all 'X'
+    a.mov(CX, 5 * 80)
+    a.mov(AX, 0x0758)
+    a.rep()
+    a.stosw()
+
+    a.mov(AX, 0x0600)                    # AH=06 AL=0: blank the window
+    a.mov(BX, 0x1F00)                    # attribute 1F
+    a.mov(CX, 0x0B0A)                    # top row 11, left column 10
+    a.mov(DX, 0x0D14)                    # bottom row 13, right column 20
+    a.int_(0x10)
+
+    a.mov(DI, 20 * 160)                  # row 20 'A'
+    a.mov(CX, 80)
+    a.mov(AX, 0x0741)
+    a.rep()
+    a.stosw()
+    a.mov(DI, 21 * 160)                  # row 21 'B'
+    a.mov(CX, 80)
+    a.mov(AX, 0x0742)
+    a.rep()
+    a.stosw()
+    a.mov(DI, 22 * 160)                  # row 22 'C'
+    a.mov(CX, 80)
+    a.mov(AX, 0x0743)
+    a.rep()
+    a.stosw()
+
+    a.mov(AX, 0x0601)                    # scroll the window up one line
+    a.mov(BX, 0x2000)
+    a.mov(CX, 0x1400)                    # top row 20, left column 0
+    a.mov(DX, 0x164F)                    # bottom row 22, right column 79
+    a.int_(0x10)
+
     # ---- graphics mode, from a program loaded off the filesystem ----
     # Switching to mode 13h and plotting through the aperture is the whole
     # graphics path end to end: INT 10h sets the mode register, the BIOS

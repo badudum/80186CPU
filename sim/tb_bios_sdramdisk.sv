@@ -155,16 +155,23 @@ module tb_bios_sdramdisk;
         chk("machine reached the boot sector's HLT", dut.halted, 1'b1);
 
         $display("");
-        for (r = 0; r <= 6; r++) begin
-            got = read_line(r, want[r].len());
+        // Row r holds what was printed as line r+1. The kernel ends by
+        // forcing a scroll from the last row -- the check that the BIOS's
+        // newline path actually scrolls rather than overwriting the bottom
+        // line -- so the whole screen has moved up one and the banner has
+        // gone off the top. want[6] ("hello") is echoed onto the last row
+        // rather than line 6, for the same reason.
+        for (r = 0; r <= 4; r++) begin
+            got = read_line(r, want[r + 1].len());
             $display("  line %0d: \"%s\"", r, got);
             checks++;
-            if (got != want[r]) begin
+            if (got != want[r + 1]) begin
                 $display("FAIL line %0d mismatch", r);
-                $display("    expected: \"%s\"", want[r]);
+                $display("    expected: \"%s\"", want[r + 1]);
                 errors++;
             end
         end
+        chk("the echo landed on the last row", read_line(24, 5) == want[6], 1'b1);
         $display("");
 
         chk("boot signature reached 0000:7DFE", chip.mem[midx('h7DFE)], 16'hAA55);

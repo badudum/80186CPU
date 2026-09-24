@@ -117,6 +117,74 @@ module tb_msdos;
     int cycles = 0;
     always @(posedge dut.clk_cpu) cycles++;
 
+    // ---- cycles per instruction ----
+    // The number that decides whether fetch-side work (a branch predictor, a
+    // prefetcher) can matter at all: if the microcode sequencer is spending
+    // tens of cycles per instruction internally, shaving cycles off fetch
+    // cannot move much. Halted cycles are excluded because parking in HLT is
+    // not work, and tb_bios is NOT a fair place to measure this -- its
+    // clear_gfx is a single REP STOSW covering 32,000 words, which retires
+    // once and runs for hundreds of thousands of cycles.
+    int retired = 0, busy_cycles = 0;
+    logic [5:0] prev_ret = 6'd0;
+
+    // ---- where the sequencer's cycles go ----
+    // CPI says the execution unit is the bottleneck; this says which part of
+    // it. Cycles are attributed to whatever state the sequencer is sitting
+    // in, and separately to whether the bus was making it wait -- a state
+    // that is slow because memory is slow needs a different fix from one
+    // that is slow because it exists at all.
+    int st_cyc  [0:63];
+    int st_wait [0:63];
+    initial for (int k = 0; k < 64; k++) begin st_cyc[k] = 0; st_wait[k] = 0; end
+
+    always @(posedge dut.clk_cpu) begin
+        if (!dut.halted) begin
+            busy_cycles++;
+            st_cyc[`EXEC.state]++;
+            if ((dut.rd || dut.wr) && !dut.ready) st_wait[`EXEC.state]++;
+        end
+        if (`EXEC.state == ST_RETIRE && prev_ret != ST_RETIRE) retired++;
+        prev_ret <= `EXEC.state;
+    end
+
+    string st_name [0:63];
+    initial begin
+        for (int k = 0; k < 64; k++) st_name[k] = "?";
+        st_name[0]="START";     st_name[1]="FETCH_OP";  st_name[2]="MODRM";
+        st_name[3]="DISP";      st_name[4]="IMM";       st_name[5]="EA";
+        st_name[6]="PREP";      st_name[7]="LOAD2";     st_name[8]="LOAD";
+        st_name[9]="EXEC";      st_name[10]="LOOP_DEC"; st_name[11]="ALU_WAIT";
+        st_name[12]="STORE";    st_name[13]="PUSH";     st_name[14]="POP";
+        st_name[15]="SP_UPD";   st_name[16]="WB";       st_name[17]="WB_HI";
+        st_name[18]="RETIRE";   st_name[19]="REDIRECT"; st_name[20]="HALT";
+        st_name[21]="INT_PREP"; st_name[22]="INT_SETUP";st_name[23]="INT_WR";
+        st_name[24]="INT_SP";   st_name[25]="INT_RDLO"; st_name[26]="INT_RDHI";
+        st_name[27]="INT_APPLY";st_name[28]="IRET_PREP";st_name[29]="IRET_RD";
+        st_name[30]="IRET_APPL";st_name[31]="INT_GAP";  st_name[32]="IRET_GAP";
+        st_name[33]="IO_RD";    st_name[34]="IO_WR";    st_name[35]="FAR_APPLY";
+        st_name[36]="SREG_WB";  st_name[37]="STR_PREP1";st_name[38]="STR_PREP2";
+        st_name[39]="STR_CHECK";st_name[40]="STR_RD1";  st_name[41]="STR_G1";
+        st_name[42]="STR_RD2";  st_name[43]="STR_G2";   st_name[44]="STR_WR";
+    end
+
+    task dump_states;
+        int tot;
+        begin
+            tot = 0;
+            for (int k = 0; k < 64; k++) tot += st_cyc[k];
+            $display("");
+            $display("  sequencer cycles by state (%0d total, CPI %0.2f):",
+                     tot, real'(tot) / real'(retired));
+            $display("    %-10s %10s %7s %10s", "state", "cycles", "share", "bus-wait");
+            for (int k = 0; k < 64; k++)
+                if (st_cyc[k] * 200 > tot)          // anything over 0.5%
+                    $display("    %-10s %10d %6.1f%% %10d",
+                             st_name[k], st_cyc[k],
+                             100.0 * st_cyc[k] / tot, st_wait[k]);
+        end
+    endtask
+
     // ---- console echo ----
     // Every byte the machine writes into the text buffer, in order. Watching
     // it arrive is the difference between "it is still running" and "it hung
@@ -500,6 +568,9 @@ module tb_msdos;
                  stall_ram, 100.0 * stall_ram / cycles);
         $display(" stalled on ROM/other: %0d (%0.1f%%)",
                  stall_other, 100.0 * stall_other / cycles);
+        $display(" %0d instructions in %0d running cycles -- CPI %0.2f",
+                 retired, busy_cycles, real'(busy_cycles) / real'(retired));
+        dump_states();
         show_regs();
         // The loop it is sitting in, for an offline disassembly.
         dump_mem(int'(cs_now) * 16 + int'(ip_now) - 128, 256);

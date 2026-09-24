@@ -72,6 +72,7 @@ SCREEN_ROWS = 25
 
 # ---- ports ----------------------------------------------------------------
 P_KBD_DATA = 0x0060
+P_KBD_STAT = 0x0064      # bit 0 set while a byte is waiting
 P_DAC_IDX  = 0x03C8
 P_DAC_DATA = 0x03C9
 P_MODE     = 0x03D8       # CGA-style mode control; bit 1 selects graphics
@@ -501,7 +502,7 @@ a.inc(AL)
 a.mov(mem(disp=B_CURSOR + 1), AL)
 a.cmp(AL, SCREEN_ROWS)
 a.jc("pc_done")
-a.call("scroll_up")
+a.call("scroll_screen")
 a.mov(AL, SCREEN_ROWS - 1)
 a.mov(mem(disp=B_CURSOR + 1), AL)
 
@@ -599,30 +600,157 @@ a.pop(ES)
 a.popa()
 a.ret()
 
+# ---------------------------------------------------------------------------
+# scroll_up -- INT 10h AH=06, properly.
+#
+# THIS USED TO IGNORE EVERY ARGUMENT. It scrolled the whole screen up by
+# exactly one line, whatever it was asked for, and that is not a partial
+# implementation -- it is the wrong operation. AL=0 does not mean "scroll
+# nothing", it means BLANK THE WHOLE WINDOW, and that is how every program
+# clears the screen. QBASIC's CLS came through here and got a one-line
+# scroll, so the display kept whatever had been on it.
+#
+#   AL = lines to scroll, 0 = blank the window
+#   BH = attribute for the blanked lines
+#   CH, CL = top row, left column      DH, DL = bottom row, right column
+#
+# Arguments live on the stack rather than in registers because MUL writes
+# DX:AX, so any row counter kept in DX is destroyed by the offset
+# arithmetic -- which is the sort of thing that works until the window is
+# not the whole screen.
+#
+#   [BP+0] loop state: +0 current row, +1 rows remaining
+#   [BP+2] BX   BH = attribute        [BP+4] AX   AL = lines
+#   [BP+6] DX   DL = right, DH = bottom
+#   [BP+8] CX   CL = left,  CH = top
+# ---------------------------------------------------------------------------
+# scroll_screen -- the whole screen up one line, in the normal attribute.
+#
+# INT 10h AH=06 takes its window and line count in registers, so the BIOS's
+# own callers have to fill them in. The teletype path did not: it called
+# scroll_up directly and happened to work only while that routine ignored its
+# arguments and always scrolled the whole screen by one. Once AH=06 was
+# implemented properly the same call passed whatever was left in AL, BH, CX
+# and DX -- so output at the bottom of the screen overwrote the last line
+# instead of scrolling. Anything inside the BIOS that wants a plain scroll
+# goes through here.
+a.label("scroll_screen")
+a.push(AX)
+a.push(BX)
+a.push(CX)
+a.push(DX)
+a.mov(AX, 0x0601)                 # AH=06, AL=1 line
+a.mov(BX, 0x0700)                 # BH = normal attribute
+a.mov(CX, 0x0000)                 # top-left  (0, 0)
+a.mov(DX, ((SCREEN_ROWS - 1) << 8) | (SCREEN_COLS - 1))
+a.call("scroll_up")
+a.pop(DX)
+a.pop(CX)
+a.pop(BX)
+a.pop(AX)
+a.ret()
+
 a.label("scroll_up")
 a.pusha()
 a.push(DS)
 a.push(ES)
+a.push(CX)
+a.push(DX)
+a.push(AX)
+a.push(BX)
+a.push(AX)                        # loop state
+a.mov(BP, SP)
+
 a.mov(AX, VIDEO_SEG)
 a.mov(DS, AX)
 a.mov(ES, AX)
-# Move rows 1..24 up one. The destination is below the source, so a forward
-# copy is the correct direction for the overlap.
-a.mov(SI, SCREEN_COLS * 2)
-a.mov(DI, 0)
-a.mov(CX, SCREEN_COLS * (SCREEN_ROWS - 1))
+
+# rows in the window = bottom - top + 1
+a.mov(AL, mem(BP, disp=7))
+a.sub(AL, mem(BP, disp=9))
+a.inc(AL)
+a.mov(AH, mem(BP, disp=4))        # lines requested
+a.cmp(AH, 0)
+a.jz("sc_all")
+a.cmp(AH, AL)
+a.jc("sc_have")                   # lines < rows: a real scroll
+a.label("sc_all")
+a.mov(mem(BP, disp=4), AL)        # lines >= rows, or 0: blank everything
+a.label("sc_have")
+
+# ---- copy phase: rows - lines rows move up by `lines` ----
+a.sub(AL, mem(BP, disp=4))
+a.mov(mem(BP, disp=1), AL)        # rows remaining to copy
+a.mov(AL, mem(BP, disp=9))
+a.mov(mem(BP, disp=0), AL)        # current row = top
+
+a.label("sc_copy")
+a.cmp(mem(BP, disp=1), 0)
+a.jz("sc_blank")
+a.call("sc_rowaddr")              # DI = start of current row
+a.mov(AL, mem(BP, disp=4))        # lines
+a.mov(AH, 0)
+a.mov(BX, SCREEN_COLS * 2)
+a.mul(BX)
+a.mov(SI, DI)
+a.add(SI, AX)                     # source is `lines` rows further down
+a.call("sc_width")                # CX = columns
 a.cld()
 a.rep()
 a.movsw()
-# blank the row that scrolled in at the bottom
-a.mov(DI, SCREEN_COLS * (SCREEN_ROWS - 1) * 2)
-a.mov(CX, SCREEN_COLS)
-a.mov(AX, 0x0720)
+a.inc(mem(BP, disp=0))
+a.dec(mem(BP, disp=1))
+a.jmps("sc_copy")
+
+# ---- blank phase: the last `lines` rows of the window ----
+a.label("sc_blank")
+a.mov(AL, mem(BP, disp=4))
+a.mov(mem(BP, disp=1), AL)        # rows remaining to blank
+
+a.label("sc_blank_row")
+a.cmp(mem(BP, disp=1), 0)
+a.jz("sc_out")
+a.call("sc_rowaddr")
+a.call("sc_width")
+a.mov(AH, mem(BP, disp=3))        # attribute
+a.mov(AL, 0x20)
+a.cld()
 a.rep()
 a.stosw()
+a.inc(mem(BP, disp=0))
+a.dec(mem(BP, disp=1))
+a.jmps("sc_blank_row")
+
+a.label("sc_out")
+a.pop(AX)
+a.pop(BX)
+a.pop(AX)
+a.pop(DX)
+a.pop(CX)
 a.pop(ES)
 a.pop(DS)
 a.popa()
+a.ret()
+
+# DI = offset of (current row, left column). Clobbers AX and BX.
+a.label("sc_rowaddr")
+a.mov(AL, mem(BP, disp=0))
+a.mov(AH, 0)
+a.mov(BX, SCREEN_COLS * 2)
+a.mul(BX)
+a.mov(DI, AX)
+a.mov(BL, mem(BP, disp=8))        # left
+a.mov(BH, 0)
+a.add(BX, BX)                     # two bytes per cell
+a.add(DI, BX)
+a.ret()
+
+# CX = right - left + 1, the window width in cells.
+a.label("sc_width")
+a.mov(CL, mem(BP, disp=6))        # right
+a.sub(CL, mem(BP, disp=8))        # - left
+a.inc(CL)
+a.mov(CH, 0)
 a.ret()
 
 # ---------------------------------------------------------------------------
@@ -763,6 +891,15 @@ a.pusha()
 a.push(DS)
 set_ds_bda()
 
+# ONE BYTE PER INTERRUPT, deliberately. A version of this drained the
+# controller in a loop, on the theory that a handler taking a single byte can
+# never catch up on a backlog. On hardware that stopped the keyboard working
+# entirely, and the reason is the thing that was actually wrong: software
+# hooks INT 09h -- EDIT's handler does -- reads port 60h itself, and chains
+# here. A loop draining the port would race that handler for the same bytes.
+# Port 60h is a single-byte latch now (see keyboard_controller.sv), and one
+# read per interrupt is what a chained handler expects.
+a.label("i09_drain")
 a.mov(DX, P_KBD_DATA)
 a.in_dx(AL)
 a.mov(BL, AL)                     # keep the raw scancode
@@ -860,13 +997,15 @@ a.mov(AH, BL)                     # AH = scancode, AL = ASCII (0 if none)
 a.call("kbuf_put")
 
 a.label("i09_done")
-# Every path that consumed a key clears the prefixes, so a stray F0 or E0
-# cannot arm them forever.
+# Every path that consumed a key clears the extended prefix, so a stray E0
+# cannot arm it forever. B_BREAK is recomputed from bit 7 of each byte, so
+# clearing it here is belt and braces rather than load-bearing.
 a.mov(AL, 0)
 a.mov(mem(disp=B_BREAK), AL)
 a.mov(mem(disp=B_EXTEND), AL)
 
 a.label("i09_leave")
+a.label("i09_exit")
 a.pop(DS)
 a.popa()
 a.iret()

@@ -62,8 +62,17 @@ module tb_keyboard;
     // Sample during the cycle, not after it: the pop happens on the clock edge
     // and `rdata` is combinational off `head`, so reading afterwards would see
     // the next entry. This is how a real bus read behaves too.
+    // Wait for the status bit before reading, which is what software does and
+    // what the output latch now requires: port 60h holds ONE byte, and the
+    // next only arrives after the keyboard's frame time. Reading blind used
+    // to work because the port was the FIFO itself.
     task read_data(output [7:0] v);
+        int guard;
         begin
+            guard = 0;
+            while (!data_avail && guard < 100000) begin
+                @(negedge clk); guard++;
+            end
             @(negedge clk);
             sel = 1; port = 0; rd = 1;
             #1 v = rdata;
@@ -84,6 +93,7 @@ module tb_keyboard;
     endtask
 
     logic [7:0] v;
+    int i;
     int         irq_count;
 
     // irq is a LEVEL, held while a byte is pending, because the interrupt
@@ -244,6 +254,56 @@ module tb_keyboard;
         ps2_send(8'h5B, 1'b1); read_data(v); chk("]     -> 1B (weapon)",v, 8'h1B);
         ps2_send(8'h41, 1'b1); read_data(v); chk("comma -> 33 (strafe L)", v, 8'h33);
         ps2_send(8'h49, 1'b1); read_data(v); chk("period-> 34 (strafe R)", v, 8'h34);
+
+        // ---- a burst longer than four keystrokes ----
+        // The FIFO used to be eight bytes, and every key sends a make AND a
+        // break, so it held only four keystrokes. A program busy redrawing a
+        // screen is away far longer than that, and a full FIFO DROPS bytes
+        // rather than stalling -- losing a make leaves a key that is never
+        // pressed, losing a break leaves one that is never released. Nothing
+        // read the FIFO during this burst, which is the point.
+        while (data_avail) read_data(v);          // start from empty
+        for (i = 0; i < 10; i++) begin
+            ps2_send(8'h1C, 1'b1);                // 'A' pressed...
+            ps2_send(8'hF0, 1'b1);                // ...and released
+            ps2_send(8'h1C, 1'b1);
+        end
+        for (i = 0; i < 10; i++) begin
+            read_data(v);
+            chk("burst: press survived", v, 8'h1E);
+            read_data(v);
+            chk("burst: release survived", v, 8'h9E);
+        end
+        chk("burst drained exactly, nothing left over", data_avail, 1'b0);
+
+        // ---- two reads of port 60h in one interrupt ----
+        // THE BUG THIS WAS ALL FOR. A real PC holds one byte at port 60h, so
+        // an ISR that reads it and then chains to the BIOS -- which EDIT's
+        // keyboard handler does -- reads 60h twice for one keystroke and gets
+        // the same scancode both times. Exposing the FIFO directly meant the
+        // pair consumed two DIFFERENT bytes, so the hooking handler took the
+        // make and the BIOS took whatever was behind it.
+        while (data_avail) read_data(v);          // start from empty
+        ps2_send(8'h1C, 1'b1);                    // one keystroke: 'A'
+        ps2_send(8'hF0, 1'b1);
+        ps2_send(8'h1C, 1'b1);
+
+        read_data(v);
+        chk("first read of 60h returns the make code", v, 8'h1E);
+        // Immediately again, as a chained handler would -- no waiting.
+        @(negedge clk);
+        sel = 1; port = 0; rd = 1;
+        #1 v = rdata;
+        @(negedge clk);
+        sel = 0; rd = 0;
+        @(negedge clk);
+        chk("an immediate second read returns the SAME byte", v, 8'h1E);
+        chk("...and the status says the buffer is empty", data_avail, 1'b0);
+
+        // The release is still queued and arrives once the keyboard would
+        // have had time to send it -- it was not eaten by the second read.
+        read_data(v);
+        chk("the release was not consumed by the double read", v, 8'h9E);
 
         $display("");
         $display("==================================");

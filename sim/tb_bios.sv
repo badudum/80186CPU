@@ -58,6 +58,25 @@ module tb_bios;
         end
     end
 
+    // ---- how many cycles an instruction actually costs ----
+    // CPI is the number that decides whether a branch predictor or a
+    // prefetcher is worth building: if the execution unit is spending ten
+    // cycles per instruction internally, shaving a few off the fetch path
+    // cannot matter much. Counted from the microcode sequencer's retire
+    // state, the same signal the MS-DOS trace uses.
+    localparam logic [5:0] ST_RETIRE = 6'd18;
+    // HALTED CYCLES ARE NOT WORK. Most of this run is the machine parked in
+    // HLT waiting for keystrokes, and counting those gave a CPI of 160 --
+    // a number that says nothing except that the testbench waits a long time.
+    int retired = 0, busy_cycles = 0;
+    logic [5:0] prev_exec = 6'd0;
+    always @(posedge dut.clk_cpu) begin
+        if (!dut.halted) busy_cycles++;
+        if (dut.u_cpu.u_eu.u_exec.state == ST_RETIRE && prev_exec != ST_RETIRE)
+            retired++;
+        prev_exec <= dut.u_cpu.u_eu.u_exec.state;
+    end
+
     int errors = 0, checks = 0;
     task chk(input string nm, input int got, input int exp);
         checks++;
@@ -171,6 +190,38 @@ module tb_bios;
         while (i < 5000000) begin @(negedge CLOCK_50); i++; end
         chk("machine reached the boot sector's HLT", dut.halted, 1'b1);
 
+        // ---- the bottom of the screen scrolls ----
+        // The kernel put a marker on row 24, homed the cursor there and
+        // printed a newline. The BIOS's newline path has to scroll, and its
+        // scroll routine takes a window and a line count in registers that
+        // the caller must set. It did not, so output at the bottom overwrote
+        // the last line. Everything on screen has therefore moved up one row,
+        // which is what the line comparison below now expects.
+        chk("the last row scrolled up one", cell_ch(23*80 + 0), 8'h51);
+        // The vacated row is not checked here: the kernel echoes "hello"
+        // into it straight afterwards. The blanking is covered by the
+        // explicit AH=06 scroll further down.
+
+        // ---- INT 10h AH=06 honours AL and the window rectangle ----
+        // The kernel filled rows 10..14 with 'X', then asked for the window
+        // rows 11..13 / columns 10..20 to be blanked with attribute 1F.
+        // Everything outside that rectangle must be untouched -- the old
+        // implementation ignored the arguments entirely and scrolled the
+        // whole screen one line, which is why CLS did not clear.
+        chk("blanked inside the window",        cell_ch(11*80 + 10), 8'h20);
+        chk("...with the requested attribute",  cell_at(11*80 + 10), 8'h1F);
+        chk("blanked to the window's last row", cell_ch(13*80 + 20), 8'h20);
+        chk("row above the window untouched",   cell_ch(10*80 + 10), 8'h58);
+        chk("row below the window untouched",   cell_ch(14*80 + 10), 8'h58);
+        chk("column left of the window kept",   cell_ch(11*80 +  9), 8'h58);
+        chk("column right of the window kept",  cell_ch(11*80 + 21), 8'h58);
+
+        // ...and AL=1 really scrolls by one line rather than blanking.
+        chk("scroll moved row 21 up to row 20", cell_ch(20*80 + 0), 8'h42);
+        chk("scroll moved row 22 up to row 21", cell_ch(21*80 + 0), 8'h43);
+        chk("scroll blanked the vacated row",   cell_ch(22*80 + 0), 8'h20);
+        chk("...with the requested attribute",  cell_at(22*80 + 0), 8'h20);
+
         // ---- modifier state, and keys that have no ASCII ----
         // The machine is halted, but HLT wakes on an interrupt, so INT 09h
         // still runs and nothing is consuming the buffer any more -- which
@@ -181,29 +232,29 @@ module tb_bios;
         // INT 16h AH=02 reported them permanently released and QBASIC, which
         // opens its menus with Alt, could not be driven.
         ps2_byte(8'h14);                        // Ctrl down (set 2 14 -> 1D)
-        repeat (4000) @(posedge CLOCK_50);
+        repeat (80000) @(posedge CLOCK_50);   // > one 1 ms frame time
         bda = chip.mem['h416 >> 1];
         chk("Ctrl sets bit 2 of 40:17", bda[15:8] & 8'h04, 8'h04);
 
         ps2_byte(8'h11);                        // Alt down (set 2 11 -> 38)
-        repeat (4000) @(posedge CLOCK_50);
+        repeat (80000) @(posedge CLOCK_50);   // > one 1 ms frame time
         bda = chip.mem['h416 >> 1];
         chk("Alt sets bit 3, Ctrl still held", bda[15:8] & 8'h0C, 8'h0C);
 
         ps2_byte(8'hF0); ps2_byte(8'h11);       // Alt up
-        repeat (4000) @(posedge CLOCK_50);
+        repeat (80000) @(posedge CLOCK_50);   // > one 1 ms frame time
         bda = chip.mem['h416 >> 1];
         chk("releasing Alt clears only its bit", bda[15:8] & 8'h0C, 8'h04);
 
         ps2_byte(8'hF0); ps2_byte(8'h14);       // Ctrl up
-        repeat (4000) @(posedge CLOCK_50);
+        repeat (80000) @(posedge CLOCK_50);   // > one 1 ms frame time
         bda = chip.mem['h416 >> 1];
         chk("releasing Ctrl clears bit 2", bda[15:8] & 8'h04, 8'h00);
 
         // A modifier must not deliver a keystroke of its own.
         tail_before = chip.mem['h41C >> 1];
         ps2_byte(8'h12); ps2_byte(8'hF0); ps2_byte(8'h12);   // shift, tapped
-        repeat (6000) @(posedge CLOCK_50);
+        repeat (160000) @(posedge CLOCK_50);  // two frame times
         chk("tapping Shift enqueued nothing", chip.mem['h41C >> 1], tail_before);
 
         // An arrow has no ASCII, and used to be thrown away for that reason --
@@ -211,7 +262,7 @@ module tb_bios;
         // delivers it as AH = scancode, AL = 00.
         tail_before = chip.mem['h41C >> 1];
         ps2_byte(8'hE0); ps2_byte(8'h75);       // Up
-        repeat (6000) @(posedge CLOCK_50);
+        repeat (160000) @(posedge CLOCK_50);  // two frame times
         tail_after = chip.mem['h41C >> 1];
         checks++;
         if (tail_after === tail_before) begin
@@ -226,13 +277,19 @@ module tb_bios;
         chk("no unexpected trap was taken", dut.dbg_int_taken, 1'b0);
 
         $display("");
-        for (r = 0; r <= 6; r++) begin
-            got = read_line(r, want[r].len());
+        // Row r now holds what was printed as line r+1: the whole screen
+        // moved up when the kernel forced a scroll, and the banner scrolled
+        // off the top. Seeing "Booting from disk 0..." at row 0 proves both
+        // that the ROM ran and that the scroll happened.
+        // want[6] ("hello") is no longer on line 6: the scroll left the
+        // cursor on the last row, so the echo lands there instead.
+        for (r = 0; r <= 4; r++) begin
+            got = read_line(r, want[r + 1].len());
             $display("  line %0d: \"%s\"", r, got);
             checks++;
-            if (got != want[r]) begin
+            if (got != want[r + 1]) begin
                 $display("FAIL line %0d mismatch", r);
-                $display("    expected: \"%s\"", want[r]);
+                $display("    expected: \"%s\"", want[r + 1]);
                 errors++;
             end
         end
@@ -264,7 +321,9 @@ module tb_bios;
 
         // ---- the cursor followed the text ----
         // Four lines were printed, so the CRTC cursor must sit on row 4.
-        chk("cursor tracked the text", dut.u_crtc.cursor_addr, 11'd485);
+        chk("the echo landed on the last row", read_line(24, 5) == want[6], 1'b1);
+        // ...and the cursor followed it there: row 24, column 5.
+        chk("cursor tracked the text", dut.u_crtc.cursor_addr, 11'd1925);
         chk("cursor still enabled", dut.u_crtc.cursor_en, 1'b1);
 
         // ---- the font image really loaded ----
@@ -348,6 +407,13 @@ module tb_bios;
                  stall_ram, 100.0 * stall_ram / cyc_total);
         $display("  stalled waiting on ROM/other: %0d (%0.1f%%)",
                  stall_other, 100.0 * stall_other / cyc_total);
+        $display("");
+        $display("  %0d instructions in %0d running cycles (%0d total)",
+                 retired, busy_cycles, cyc_total);
+        $display("  CPI %0.2f   bus-request cycles %0.1f%%   stalled on RAM %0.1f%%",
+                 real'(busy_cycles) / real'(retired),
+                 100.0 * bus_cycles / busy_cycles,
+                 100.0 * stall_ram / busy_cycles);
         $display("");
         $display("==================================");
         $display(" checks: %0d   failures: %0d", checks, errors);

@@ -70,7 +70,11 @@ module keyboard_controller #(
     // is occasionally useful when debugging the PS/2 link itself -- but the
     // BIOS's own key table is set 1 now, so a build with this clear will not
     // type correctly either.
-    parameter bit XLAT = 1'b1
+    parameter bit XLAT = 1'b1,
+    // Cycles the output latch stays empty after a read, modelling the time a
+    // real keyboard takes to put the next frame on the wire. The board sets
+    // this from CLK_HZ; the default is small so unit tests are not slowed.
+    parameter int HOLD = 1000
 ) (
     input  logic       clk,
     input  logic       rst_n,
@@ -131,7 +135,15 @@ module keyboard_controller #(
                         (^shreg[9:1] == 1'b1);
 
     // ---- FIFO ----
-    localparam int DEPTH = 8;
+    // EIGHT BYTES IS FOUR KEYSTROKES, because every key sends a make and a
+    // break. A program that is busy redrawing a screen -- an editor, say --
+    // can easily be away that long, and a full FIFO DROPS bytes rather than
+    // stalling: the push below is gated on `count < DEPTH`. A dropped byte is
+    // worse than a late one, because losing a make leaves a key that is
+    // never pressed, and losing a break leaves one that is never released.
+    // 32 costs almost nothing here and covers sixteen keystrokes.
+    localparam int DEPTH = 32;
+    localparam int AW    = $clog2(DEPTH);
     // 8 x 8 bits = 64 bits. Left to itself Quartus infers an M10K for this and
     // then bolts pass-through logic onto it to reproduce the read-during-write
     // behaviour -- spending a whole 10 Kbit block, plus ALMs, to be slower
@@ -174,12 +186,41 @@ module keyboard_controller #(
     end
 
     (* ramstyle = "logic" *) logic [7:0] fifo [0:DEPTH-1];
-    logic [2:0] head, tail;
-    logic [3:0] count;
+    logic [AW-1:0]   head, tail;
+    logic [AW:0]     count;
 
-    logic pop;
-    assign pop        = sel && rd && (port == 1'b0) && (count != 4'd0);
-    assign data_avail = (count != 4'd0);
+    // ---- the output buffer, and why port 60h is NOT the FIFO ----
+    // A real PC has ONE byte at port 60h. Reading it clears the
+    // output-buffer-full flag; reading again returns the SAME byte, because
+    // the next one only appears when the keyboard gets around to sending it.
+    // Software relies on that. An ISR that chains -- and they do, EDIT's
+    // reads port 60h and then jumps to the BIOS handler -- reads 60h TWICE
+    // for one keystroke and expects the same scancode both times.
+    //
+    // Exposing the FIFO directly broke exactly that. Every read popped, so
+    // the chained pair consumed two different bytes: the hooking handler took
+    // the make and the BIOS took whatever was behind it. One keystroke in,
+    // two bytes out, and the BIOS acting on the wrong one -- which is what
+    // put typing a fixed number of characters behind inside EDIT while the
+    // DOS prompt, where nothing hooks INT 09h, looked fine.
+    //
+    // So the FIFO stays, standing in for the buffer inside a real keyboard,
+    // and a single latch in front of it is what port 60h actually reads.
+    logic [7:0]                  obuf;
+    logic                        obf;
+    logic [$clog2(HOLD+1)-1:0]   hold;
+
+    // THE HOLD-OFF IS THE POINT, not a detail. Refilling the latch the
+    // instant it is read would recreate the bug: the chained handler's second
+    // read would find the next byte already loaded. A real keyboard needs
+    // about a millisecond to put the next frame on the wire, and that gap is
+    // what makes a double read safe. Modelling it costs nothing -- it still
+    // allows a thousand bytes a second, well past any typist.
+    logic take, load;
+    assign take = sel && rd && (port == 1'b0) && obf;
+    assign load = !obf && (hold == '0) && (count != '0);
+
+    assign data_avail = obf;
 
     // IRQ IS A LEVEL, NOT A PULSE. The interrupt controller samples its
     // external INT pins combinationally and latches nothing
@@ -193,7 +234,7 @@ module keyboard_controller #(
     // remain the request simply stays up and the handler is re-entered, which
     // is the behaviour a level-triggered input is supposed to have.
     assign irq = data_avail;
-    assign rdata      = (port == 1'b0) ? fifo[head] : {7'h00, data_avail};
+    assign rdata      = (port == 1'b0) ? obuf : {7'h00, data_avail};
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -201,10 +242,13 @@ module keyboard_controller #(
             bitcnt     <= 4'd0;
             idle_cnt   <= '0;
             frame_done <= 1'b0;
-            head       <= 3'd0;
-            tail       <= 3'd0;
-            count      <= 4'd0;
+            head       <= '0;
+            tail       <= '0;
+            count      <= '0;
             brk        <= 1'b0;
+            obuf       <= 8'h00;
+            obf        <= 1'b0;
+            hold       <= '0;
         end else begin
             frame_done <= 1'b0;
 
@@ -248,13 +292,24 @@ module keyboard_controller #(
             // latched, so a corrupt byte never reaches software.
             if (push && (count < DEPTH)) begin
                 fifo[tail] <= push_data;
-                tail       <= tail + 3'd1;
-                count      <= count + 4'd1 - {3'b0, pop};
-            end else if (pop) begin
-                count <= count - 4'd1;
+                tail       <= tail + 1'b1;
+                count      <= count + 1'b1 - {{AW{1'b0}}, load};
+            end else if (load) begin
+                count <= count - 1'b1;
             end
 
-            if (pop) head <= head + 3'd1;
+            if (load) head <= head + 1'b1;
+
+            // ---- output latch ----
+            if (take) begin
+                obf  <= 1'b0;
+                hold <= HOLD[$bits(hold)-1:0];
+            end else if (hold != '0) begin
+                hold <= hold - 1'b1;
+            end else if (load) begin
+                obuf <= fifo[head];
+                obf  <= 1'b1;
+            end
         end
     end
 

@@ -150,6 +150,26 @@ module tb_iodecode;
     endtask
 
     // ---- a bus cycle shaped like the BIU's ----
+    // Port 60h holds ONE byte and refills only after the keyboard's frame
+    // time, exactly as a real 8042 does -- so a reader has to check the
+    // status bit first. Reading blind used to work because the port was the
+    // FIFO itself, which is the very thing that broke chained INT 09h
+    // handlers. See keyboard_controller.sv.
+    task kbd_read(output [15:0] d);
+        int guard;
+        begin
+            // Wait on kbd_avail directly rather than polling port 64h: a
+            // status read is a real bus cycle and the strobe checks below
+            // count those. (This task called bus_read, not itself -- a
+            // careless global rename made it recursive, which hung the run.)
+            guard = 0;
+            while (!kbd_avail && guard < 200000) begin
+                @(negedge clk); guard++;
+            end
+            bus_read(16'h0060, d);
+        end
+    endtask
+
     task bus_read(input [15:0] a, output [15:0] d);
         begin
             @(negedge clk);
@@ -237,11 +257,11 @@ module tb_iodecode;
         kbd_rd_pulses = 0;
 
         // Each of these must return the NEXT byte, not the one after it.
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("bus read 1 returned the first scancode", d, 16'h0038);
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("bus read 2 returned the second scancode", d, 16'h002D);
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("bus read 3 returned the third scancode", d, 16'h0023);
 
         chk("FIFO drained by exactly three reads", kbd_avail, 1'b0);
@@ -252,18 +272,19 @@ module tb_iodecode;
         ps2_send(8'h44);
         ps2_send(8'h55);
 
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("later read returned the right byte", d, 16'h0018);   // set 2 44
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("later read 2 returned the right byte", d, 16'h000D);   // set 2 55
         chk("FIFO drained again", kbd_avail, 1'b0);
         chk("still one strobe per cycle", kbd_rd_pulses, 2);
 
         // ---- reading an empty FIFO must not underflow ----
+        // Blind on purpose: there is nothing to wait for.
         bus_read(16'h0060, d);
         chk("empty read did not wrap the FIFO", kbd_avail, 1'b0);
         ps2_send(8'h66);
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("FIFO still correct after an empty read", d, 16'h000E);   // set 2 66
 
         // ---- port 61h: the refresh toggle must actually toggle ----
@@ -352,7 +373,7 @@ module tb_iodecode;
 
         // A keyboard access must not have been disturbed by any of that.
         ps2_send(8'h77);
-        bus_read(16'h0060, d);
+        kbd_read(d);
         chk("keyboard still correct after storage traffic", d, 16'h0045);   // set 2 77
 
         // ---- CRTC, and with it the odd-address byte lane ----
