@@ -138,6 +138,7 @@ module biu (
     logic        pq_write_en, pq_write_word, pq_space;
     logic [15:0] pq_write_data;
 
+    logic [7:0] pq_peek [0:5];        // not used yet; see prefetch_queue.sv
     prefetch_queue u_pq (
         .clk             (clk),
         .rst_n           (rst_n),
@@ -145,7 +146,11 @@ module biu (
         .write_data      (pq_write_data),
         .write_word      (pq_write_word),
         .space_available (pq_space),
-        .pop             (fetch_pop),
+        // One byte at a time for now: the EU still consumes the instruction
+        // byte by byte. The decode stage is what will start asking for a
+        // whole instruction's worth in one cycle.
+        .pop_n           (fetch_pop ? 3'd1 : 3'd0),
+        .peek            (pq_peek),
         .pop_data        (fetch_data),
         .pop_valid       (fetch_valid),
         .flush           (fetch_set),

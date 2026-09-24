@@ -77,6 +77,71 @@ module tb_bios;
         prev_exec <= dut.u_cpu.u_eu.u_exec.state;
     end
 
+    // ---- decode_len shadow, fast iteration ----
+    // Same check tb_msdos runs, here because this testbench finishes in a
+    // minute rather than eleven. Prints the offending bytes, which is the
+    // only way to tell a wrong rule from a wrong measurement.
+    logic [7:0] dl_peek [0:5];
+    logic [3:0] dl_count;
+    logic       dl_valid;
+    logic [2:0] dl_len, dl_npfx;
+    logic       dl_rep, dl_seg;
+    logic [1:0] dl_segovr;
+
+    always_comb begin
+        for (int i = 0; i < 6; i++) dl_peek[i] = dut.u_cpu.u_biu.u_pq.peek[i];
+        dl_count = dut.u_cpu.u_biu.u_pq.count;
+    end
+
+    decode_len u_dl (
+        .peek (dl_peek), .count (dl_count), .valid (dl_valid),
+        .len (dl_len), .n_prefix (dl_npfx),
+        .has_rep (dl_rep), .has_seg_ovr (dl_seg), .seg_ovr (dl_segovr)
+    );
+
+    localparam logic [5:0] ST_FETCH_OP = 6'd1;
+    int dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
+    logic       dl_armed = 1'b0;
+    logic [2:0] dl_pred;
+    logic [7:0] dl_b [0:5];
+    int         dl_bytes;
+    logic [5:0] dl_prev = 6'd0;
+
+    // The #1 is not cosmetic. dl_peek is driven by an always_comb and
+    // decode_len's outputs are another delta behind it, so reading them from
+    // a different always block at the same instant samples stale values --
+    // which showed up as a one-byte instruction being predicted as three.
+    always @(negedge dut.clk_cpu) begin
+        #1;
+        if (dut.u_cpu.u_eu.u_exec.state == ST_FETCH_OP && dl_prev != ST_FETCH_OP
+            && !dut.u_cpu.u_eu.u_exec.prefix_seen) begin
+            dl_bytes = 0;
+            if (dl_valid) begin
+                dl_armed = 1'b1;
+                dl_pred  = dl_len;
+                for (int i = 0; i < 6; i++) dl_b[i] = dl_peek[i];
+            end else begin
+                dl_armed = 1'b0;
+                dl_unknown++;
+            end
+        end
+        if (dl_armed) dl_bytes = dl_bytes + dut.u_cpu.u_biu.u_pq.do_pop;
+        if (dut.u_cpu.u_eu.u_exec.state == ST_RETIRE && dl_prev != ST_RETIRE) begin
+            if (dl_armed) begin
+                dl_checked++;
+                if (dl_bytes != {29'd0, dl_pred}) begin
+                    if (dl_mismatch < 12)
+                        $display("  DL MISMATCH pred=%0d popped=%0d bytes: %02h %02h %02h %02h %02h %02h",
+                                 dl_pred, dl_bytes,
+                                 dl_b[0], dl_b[1], dl_b[2], dl_b[3], dl_b[4], dl_b[5]);
+                    dl_mismatch++;
+                end
+            end
+            dl_armed = 1'b0;
+        end
+        dl_prev = dut.u_cpu.u_eu.u_exec.state;
+    end
+
     int errors = 0, checks = 0;
     task chk(input string nm, input int got, input int exp);
         checks++;
@@ -414,6 +479,9 @@ module tb_bios;
                  real'(busy_cycles) / real'(retired),
                  100.0 * bus_cycles / busy_cycles,
                  100.0 * stall_ram / busy_cycles);
+        $display("");
+        $display("  decode_len shadow: %0d checked, %0d mismatched, %0d unknowable",
+                 dl_checked, dl_mismatch, dl_unknown);
         $display("");
         $display("==================================");
         $display(" checks: %0d   failures: %0d", checks, errors);

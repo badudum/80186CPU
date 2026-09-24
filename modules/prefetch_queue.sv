@@ -39,8 +39,17 @@ module prefetch_queue (
     output logic        space_available, // room for a full word
 
     // Pop side (to eu)
-    input  logic        pop,
-    output logic [7:0]  pop_data,
+    // CONSUMPTION IS BY COUNT, NOT BY PULSE. The EU used to take one byte
+    // per cycle, which meant an instruction already sitting whole in the
+    // queue still cost a cycle per byte to read in -- opcode, ModR/M,
+    // displacement, immediate, one state each. Measured on the MS-DOS boot
+    // that was 3.5 million cycles, 17.7% of all of them, spent fetching
+    // bytes that had already arrived. `peek` exposes the queue contents so a
+    // whole instruction can be examined at once, and `pop_n` retires all of
+    // it in a single cycle.
+    input  logic [2:0]  pop_n,          // bytes to consume this cycle, 0..DEPTH
+    output logic [7:0]  peek [0:5],     // peek[i] = byte i ahead of the head
+    output logic [7:0]  pop_data,       // == peek[0], kept for one-byte users
     output logic        pop_valid,
 
     // Control
@@ -54,10 +63,13 @@ module prefetch_queue (
     logic [2:0] head, tail;
     logic [3:0] cnt;
 
-    logic       do_pop;
+    logic [2:0] do_pop;
     logic [1:0] push_n;
 
-    assign do_pop = pop && (cnt != 4'd0);
+    // Clamped, so asking for more than is present consumes only what is
+    // there. A decoder that mispredicts an instruction's length must not be
+    // able to run the head past the tail.
+    assign do_pop = ({1'b0, pop_n} > cnt) ? cnt[2:0] : pop_n;
     always_comb begin
         if (!write_en)      push_n = 2'd0;
         else if (write_word) push_n = 2'd2;
@@ -65,8 +77,19 @@ module prefetch_queue (
     end
 
     assign pop_valid = (cnt != 4'd0);
-    assign pop_data  = q[head];
+    assign pop_data  = peek[0];
     assign count     = cnt;
+
+    // Byte i ahead of the head, wrapped. Bytes past `cnt` are not valid and
+    // the reader is expected to check `count` before believing them.
+    logic [3:0] peek_idx [0:5];
+    always_comb begin
+        for (int i = 0; i < DEPTH; i++) begin
+            peek_idx[i] = {1'b0, head} + i[3:0];
+            if (peek_idx[i] >= DEPTH) peek_idx[i] = peek_idx[i] - DEPTH[3:0];
+            peek[i] = q[peek_idx[i][2:0]];
+        end
+    end
 
     // Conservative by one: the BIU only starts a fetch cycle when a whole word
     // will fit on arrival, and a bus cycle takes at least 4 clocks, so leaving
@@ -83,7 +106,12 @@ module prefetch_queue (
     assign tail_sum  = {1'b0, tail} + {2'b0, push_n};
     assign tail_next = (tail_sum >= DEPTH) ? (tail_sum[2:0] - DEPTH[2:0]) : tail_sum[2:0];
     assign tail_p1   = (tail == DEPTH-1) ? 3'd0 : (tail + 3'd1);
-    assign head_next = (head == DEPTH-1) ? 3'd0 : (head + 3'd1);
+    // The head can now move by more than one, so it wraps by subtraction
+    // rather than by a compare against DEPTH-1.
+    logic [3:0] head_sum;
+    assign head_sum  = {1'b0, head} + {1'b0, do_pop};
+    assign head_next = (head_sum >= DEPTH) ? (head_sum[2:0] - DEPTH[2:0])
+                                           : head_sum[2:0];
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -102,9 +130,9 @@ module prefetch_queue (
                 tail <= tail_next;
             end
 
-            if (do_pop) head <= head_next;
+            if (do_pop != 3'd0) head <= head_next;
 
-            cnt <= cnt + {2'b0, push_n} - {3'b0, do_pop};
+            cnt <= cnt + {2'b0, push_n} - {1'b0, do_pop};
         end
     end
 

@@ -83,6 +83,8 @@ case "$TB" in
     tb_storage)        RTL=("$PKG" "$REPO/modules/storage.sv") ;;
     tb_pit)            RTL=("$PKG" "$REPO/modules/pit8253.sv") ;;
     tb_cache)          RTL=("$PKG" "$REPO/modules/cache.sv") ;;
+    tb_decode_len)     RTL=("$PKG" "$REPO/modules/decode.sv"
+                            "$REPO/modules/decode_len.sv") ;;
     tb_blitter)        RTL=("$PKG" "$REPO/modules/blitter.sv" "$REPO/modules/framebuffer.sv") ;;
     tb_vga)            RTL=("$PKG" "$REPO/modules/vga_controller.sv" "$REPO/modules/font_rom.sv" "$REPO/modules/vga_dac.sv") ;;
     tb_sdram)          RTL=("$PKG" "$REPO/modules/sdram_controller.sv" "$REPO/sim/sdram_model.sv") ;;
@@ -90,6 +92,7 @@ case "$TB" in
                             "$REPO/modules/ALU.sv"
                             "$REPO/modules/regfile.sv"
                             "$REPO/modules/decode.sv"
+                            "$REPO/modules/decode_len.sv"
                             "$REPO/modules/microcode.sv"
                             "$REPO/modules/execUnit.sv"
                             "$REPO/modules/eu.sv"
@@ -138,6 +141,7 @@ case "$TB" in
                             "$REPO/modules/ALU.sv"
                             "$REPO/modules/regfile.sv"
                             "$REPO/modules/decode.sv"
+                            "$REPO/modules/decode_len.sv"
                             "$REPO/modules/microcode.sv"
                             "$REPO/modules/execUnit.sv"
                             "$REPO/modules/eu.sv"

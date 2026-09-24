@@ -148,6 +148,89 @@ module tb_msdos;
         prev_ret <= `EXEC.state;
     end
 
+    // ---- shadow check: does decode_len agree with the sequencer? ----
+    // Hand-worked encodings in tb_decode_len prove the rules; this proves
+    // them against the real instruction stream, which is the only thing that
+    // covers the encodings DOS actually uses. A wrong length does not corrupt
+    // one instruction, it moves the queue head to the wrong byte and every
+    // instruction after it decodes from garbage -- so this has to agree a
+    // million times, not most of the time.
+    //
+    // The sequencer's own answer is how far IP moved: instr_start_ip marks
+    // the first PREFIX byte of the instruction, and ip_next is where the next
+    // one begins. Jumps are excluded because IP then comes from the target,
+    // not from the length.
+    logic [7:0] dl_peek [0:5];
+    logic [3:0] dl_count;
+    logic       dl_valid;
+    logic [2:0] dl_len, dl_npfx;
+    logic       dl_rep, dl_seg;
+    logic [1:0] dl_segovr;
+
+    always_comb begin
+        for (int i = 0; i < 6; i++) dl_peek[i] = dut.u_cpu.u_biu.u_pq.peek[i];
+        dl_count = dut.u_cpu.u_biu.u_pq.count;
+    end
+
+    decode_len u_dl (
+        .peek (dl_peek), .count (dl_count), .valid (dl_valid),
+        .len (dl_len), .n_prefix (dl_npfx),
+        .has_rep (dl_rep), .has_seg_ovr (dl_seg), .seg_ovr (dl_segovr)
+    );
+
+    localparam logic [5:0] ST_FETCH_OP = 6'd1;
+    int dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
+    logic       dl_armed = 1'b0;
+    logic [2:0] dl_pred;
+    int         dl_bytes;
+    logic [5:0] dl_prev = 6'd0;
+
+    // SAMPLED ON THE NEGEDGE, and counting bytes rather than inferring them
+    // from IP. Two reasons, both of which produced a false 13% mismatch rate
+    // on the first attempt:
+    //
+    //   Reading `state` on the posedge races its own non-blocking update, so
+    //   the state was a cycle stale while the combinational queue read was
+    //   not. Everything has settled by the negedge.
+    //
+    //   IP movement is a proxy for length, not length itself. Counting what
+    //   the queue actually retired measures exactly what decode_len claims.
+    // The #1 is not cosmetic. dl_peek is driven by an always_comb and
+    // decode_len's outputs are another delta behind it, so reading them from
+    // a different always block at the same instant samples stale values --
+    // which showed up as a one-byte instruction being predicted as three.
+    always @(negedge dut.clk_cpu) begin
+        #1;
+        if (`EXEC.state == ST_FETCH_OP && dl_prev != ST_FETCH_OP
+            && !`EXEC.prefix_seen) begin
+            dl_bytes = 0;
+            if (dl_valid) begin
+                dl_armed = 1'b1;
+                dl_pred  = dl_len;
+            end else begin
+                dl_armed = 1'b0;          // length not yet determinable
+                dl_unknown++;
+            end
+        end
+
+        // do_pop is what the queue will retire on the coming edge.
+        if (dl_armed) dl_bytes = dl_bytes + dut.u_cpu.u_biu.u_pq.do_pop;
+
+        if (`EXEC.state == ST_RETIRE && dl_prev != ST_RETIRE) begin
+            if (dl_armed) begin
+                dl_checked++;
+                if (dl_bytes != {29'd0, dl_pred}) begin
+                    if (dl_mismatch < 10)
+                        $display("  DECODE_LEN MISMATCH: predicted %0d, queue retired %0d",
+                                 dl_pred, dl_bytes);
+                    dl_mismatch++;
+                end
+            end
+            dl_armed = 1'b0;
+        end
+        dl_prev = `EXEC.state;
+    end
+
     string st_name [0:63];
     initial begin
         for (int k = 0; k < 64; k++) st_name[k] = "?";
@@ -571,6 +654,9 @@ module tb_msdos;
         $display(" %0d instructions in %0d running cycles -- CPI %0.2f",
                  retired, busy_cycles, real'(busy_cycles) / real'(retired));
         dump_states();
+        $display("");
+        $display(" decode_len shadow: %0d checked, %0d mismatched, %0d not yet knowable",
+                 dl_checked, dl_mismatch, dl_unknown);
         show_regs();
         // The loop it is sitting in, for an offline disassembly.
         dump_mem(int'(cs_now) * 16 + int'(ip_now) - 128, 256);

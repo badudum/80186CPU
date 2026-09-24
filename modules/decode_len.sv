@@ -1,0 +1,167 @@
+// ---------------------------------------------------------------------------
+// decode_len — how many bytes is the instruction at the head of the queue?
+//
+// Hierarchy: cpu_top -> eu -> execUnit -> decode_len
+// Testbench: sim/tb_decode_len.sv, and a shadow check in sim/tb_msdos.sv
+//
+// WHY THIS EXISTS. The execution unit consumed the instruction stream one
+// byte per cycle: a state for the opcode, another for the ModR/M, another for
+// each displacement byte, another for each immediate byte. Measured on the
+// MS-DOS boot those four states cost 4,545,164 cycles, of which only
+// 1,030,953 was waiting for the bus -- so 3.5 million cycles, 17.7% of every
+// cycle the machine ran, went on reading bytes that had ALREADY ARRIVED and
+// were sitting in the prefetch queue.
+//
+// Knowing the whole length up front is what collapses that: the queue can
+// hand over the entire instruction in one go (prefetch_queue's `pop_n`) and
+// the sequencer can start at the work rather than at the reading.
+//
+// LENGTH DECODE IS THE HARD PART OF x86 and the reason this is a module
+// rather than an expression. The length depends on the opcode, then on the
+// ModR/M mod and rm fields, then on whether that opcode takes an 8- or
+// 16-bit immediate, and prefixes stack ahead of all of it. Getting it wrong
+// does not produce a wrong answer in one instruction -- it DESYNCHRONISES
+// THE STREAM, and everything after it decodes from the wrong byte.
+//
+// So this does not re-derive any of it. decode.sv already computes has_modrm,
+// disp_bytes and imm_bytes, and this instantiates the same module the
+// sequencer uses rather than keeping a second copy of those rules that could
+// drift. The prefix set is the one execUnit recognises, for the same reason.
+//
+// `valid` is the other half of not desynchronising: the length is only
+// meaningful once enough bytes are present to have determined it. A ModR/M
+// that has not arrived yet cannot tell you how many displacement bytes
+// follow, so the answer is "not yet" rather than a guess.
+// ---------------------------------------------------------------------------
+
+`timescale 1ns/1ns
+module decode_len
+    import cpu_pkg::*;
+(
+    // The queue, oldest byte first, and how many of them are real.
+    input  logic [7:0]  peek [0:5],
+    input  logic [3:0]  count,
+
+    output logic        valid,        // enough bytes present to know the length
+    output logic [2:0]  len,          // total bytes, prefixes included
+    output logic [2:0]  n_prefix,     // how many of those are prefixes
+    output logic        has_rep,
+    output logic        has_seg_ovr,
+    output logic [1:0]  seg_ovr
+);
+
+    // ---- prefixes ----
+    // Scanned rather than looped so the whole thing stays combinational and
+    // flat. Three is enough for anything this core executes: a segment
+    // override, a repeat and a lock.
+    localparam int MAXPFX = 3;
+
+    logic is_pfx [0:MAXPFX-1];
+    logic is_seg [0:MAXPFX-1];
+    logic is_rep [0:MAXPFX-1];
+
+    function automatic logic pfx_seg(input logic [7:0] b);
+        pfx_seg = (b == 8'h26) || (b == 8'h2E) || (b == 8'h36) || (b == 8'h3E);
+    endfunction
+    function automatic logic pfx_rep(input logic [7:0] b);
+        pfx_rep = (b == 8'hF2) || (b == 8'hF3);
+    endfunction
+    function automatic logic pfx_any(input logic [7:0] b);
+        pfx_any = pfx_seg(b) || pfx_rep(b) || (b == 8'hF0);   // F0 = LOCK
+    endfunction
+
+    // A prefix only counts if the byte before it was one too, so the scan
+    // stops at the first non-prefix.
+    always_comb begin
+        is_pfx[0] = pfx_any(peek[0]);
+        is_pfx[1] = is_pfx[0] && pfx_any(peek[1]);
+        is_pfx[2] = is_pfx[1] && pfx_any(peek[2]);
+        for (int i = 0; i < MAXPFX; i++) begin
+            is_seg[i] = is_pfx[i] && pfx_seg(peek[i]);
+            is_rep[i] = is_pfx[i] && pfx_rep(peek[i]);
+        end
+    end
+
+    always_comb begin
+        n_prefix = 3'd0;
+        for (int i = 0; i < MAXPFX; i++) if (is_pfx[i]) n_prefix = n_prefix + 3'd1;
+    end
+
+    assign has_rep     = is_rep[0] || is_rep[1] || is_rep[2];
+    assign has_seg_ovr = is_seg[0] || is_seg[1] || is_seg[2];
+
+    // The LAST segment override wins, which is what a real 8086 does.
+    always_comb begin
+        seg_ovr = SR_DS;
+        for (int i = 0; i < MAXPFX; i++)
+            if (is_seg[i]) begin
+                case (peek[i])
+                    8'h26:   seg_ovr = SR_ES;
+                    8'h2E:   seg_ovr = SR_CS;
+                    8'h36:   seg_ovr = SR_SS;
+                    default: seg_ovr = SR_DS;
+                endcase
+            end
+    end
+
+    // ---- opcode and ModR/M, at whatever offset the prefixes left them ----
+    logic [7:0] op_byte, modrm_byte;
+    assign op_byte    = peek[n_prefix];
+    assign modrm_byte = peek[(n_prefix + 3'd1 > 3'd5) ? 3'd5 : n_prefix + 3'd1];
+
+    logic       d_has_modrm, d_word, d_dir, d_sext, d_rm_mem;
+    logic [5:0] d_iclass, d_alu;
+    logic [2:0] d_imm_bytes, d_opreg, d_regf, d_rmf;
+    logic [3:0] d_cond;
+    logic [1:0] d_mod, d_disp_bytes;
+
+    // The same decoder the sequencer uses. Not a copy of its rules.
+    decode u_dec (
+        .opcode     (op_byte),
+        .modrm      (modrm_byte),
+        .iclass     (d_iclass),
+        .has_modrm  (d_has_modrm),
+        .word_op    (d_word),
+        .dir_to_reg (d_dir),
+        .alu_op     (d_alu),
+        .imm_bytes  (d_imm_bytes),
+        .imm_sext   (d_sext),
+        .op_reg     (d_opreg),
+        .cond       (d_cond),
+        .mod_field  (d_mod),
+        .reg_field  (d_regf),
+        .rm_field   (d_rmf),
+        .disp_bytes (d_disp_bytes),
+        .rm_is_mem  (d_rm_mem)
+    );
+
+    // ---- length, and whether we are entitled to believe it ----
+    logic [3:0] need_for_len;      // bytes required before the length is known
+    logic [3:0] total;
+
+    // DISP_BYTES IS ONLY MEANINGFUL WHEN THERE IS A ModR/M. decode.sv derives
+    // it from the mod field of whatever byte it is handed, and for an opcode
+    // with no ModR/M that byte is the immediate, or the next instruction.
+    // MOV AX,imm16 (B8) is the case that caught this: `B8 40 00` decodes the
+    // 40 as mod=01 and invents a displacement byte, giving length 4 for a
+    // three-byte instruction. The hand-written test used `B8 34 12`, and 34
+    // decodes as mod=00 with no displacement, so it passed -- the bug is
+    // DATA-DEPENDENT, which is why it took the real instruction stream to
+    // find it. Every don't-care field out of decode.sv needs this treatment.
+    logic [1:0] eff_disp;
+    assign eff_disp = d_has_modrm ? d_disp_bytes : 2'd0;
+
+    assign need_for_len = {1'b0, n_prefix} + (d_has_modrm ? 4'd2 : 4'd1);
+    assign total        = {1'b0, n_prefix} + 4'd1
+                        + (d_has_modrm ? 4'd1 : 4'd0)
+                        + {2'b0, eff_disp}
+                        + {1'b0, d_imm_bytes};
+
+    // Two separate conditions, and conflating them is a bug waiting to
+    // happen: the length is KNOWN once the opcode and any ModR/M have
+    // arrived, but the instruction is only CONSUMABLE once all of it has.
+    // A caller that pops on "known" would run past the tail.
+    assign valid = (count >= need_for_len) && (count >= total) && (total <= 4'd6);
+    assign len   = total[2:0];
+
+endmodule
