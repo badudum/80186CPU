@@ -75,7 +75,11 @@ module execUnit
     // ---- instruction bytes, from the BIU prefetch queue ----
     input  logic [7:0]  fetch_data,
     input  logic        fetch_valid,
-    output logic        fetch_pop,
+    // Bytes to retire this cycle. One for the byte-at-a-time path, more when
+    // the whole instruction is already in the queue.
+    output logic [2:0]  fetch_pop_n,
+    input  logic [7:0]  fetch_peek [0:5],
+    input  logic [3:0]  fetch_count,
     output logic        fetch_set,
     output logic [19:0] fetch_addr,
 
@@ -319,6 +323,36 @@ module execUnit
     // Prefix recognition works on the raw fetched byte rather than through
     // decode, because decode looks at opcode_r and a prefix must never become
     // opcode_r.
+    // ---- how much of the instruction is already in the queue? ----
+    // decode_len looks at the queue directly rather than at the registered
+    // opcode, so the sequencer can know the shape of the instruction it is
+    // ABOUT to read rather than the one it just read. See decode_len.sv.
+    logic       dl_valid;
+    logic [2:0] dl_len, dl_npfx;
+    logic       dl_rep, dl_segovr_en;
+    logic [1:0] dl_segovr;
+
+    logic       dl_has_modrm;
+    logic [2:0] dl_imm_bytes;
+
+    decode_len u_dlen (
+        .peek         (fetch_peek),
+        .count        (fetch_count),
+        .valid        (dl_valid),
+        .len          (dl_len),
+        .n_prefix     (dl_npfx),
+        .op_has_modrm (dl_has_modrm),
+        .op_imm_bytes (dl_imm_bytes),
+        .has_rep      (dl_rep),
+        .has_seg_ovr  (dl_segovr_en),
+        .seg_ovr      (dl_segovr)
+    );
+
+    // The byte-at-a-time path still drives a single-byte pop; the fast path
+    // below overrides it with the whole instruction's length.
+    logic       fetch_pop;
+
+
     logic       fetch_is_seg_ovr, fetch_is_rep, fetch_is_lock, fetch_is_prefix;
     logic [1:0] fetch_seg;
     always_comb begin
@@ -457,6 +491,16 @@ module execUnit
             default: imm_last = 2'd0;
         endcase
     end
+
+    // A 16-bit immediate is two states today, one per byte, even when both
+    // bytes are sitting in the queue. imm_take2 spots that case so S_IMM can
+    // retire the pair in one cycle; everything else still goes a byte at a
+    // time, including the far-pointer forms with four immediate bytes.
+    logic imm_take2;
+    assign imm_take2 = (state == S_IMM) && (imm_idx == 2'd0)
+                       && (imm_last == 2'd1) && (fetch_count >= 4'd2);
+
+    assign fetch_pop_n = imm_take2 ? 3'd2 : (fetch_pop ? 3'd1 : 3'd0);
 
     logic is_muldiv, is_grp3_test;
     assign is_muldiv    = (alu_op == ALU_MUL) || (alu_op == ALU_IMUL) ||
@@ -1173,7 +1217,27 @@ module execUnit
                     end else if (fetch_valid) begin
                         opcode_r <= fetch_data;
                         ip_next  <= ip_next + 16'd1;
-                        state    <= S_MODRM;
+                        // SKIP S_MODRM WHEN THERE IS NO ModR/M BYTE. That
+                        // state would only transition, and every instruction
+                        // was paying for it: 1,077,357 cycles across 968,049
+                        // instructions on the MS-DOS boot.
+                        //
+                        // The decision has to come from the byte being read,
+                        // not from `has_modrm`, which is decoded from the
+                        // REGISTERED opcode and so still describes the
+                        // previous instruction. decode_len looks at the queue
+                        // directly, which is the whole reason it is here.
+                        //
+                        // prefix_seen is cleared here because S_MODRM is
+                        // where that normally happens; skipping the state
+                        // without clearing it leaves the next instruction
+                        // believing it is still scanning prefixes.
+                        if (!dl_has_modrm) begin
+                            prefix_seen <= 1'b0;
+                            state <= (dl_imm_bytes != 3'd0) ? S_IMM : S_PREP;
+                        end else begin
+                            state <= S_MODRM;
+                        end
                     end
                 end
 
@@ -1215,7 +1279,15 @@ module execUnit
                 end
 
                 S_IMM: begin
-                    if (fetch_valid) begin
+                    if (imm_take2) begin
+                        // Both bytes at once. The byte order is the same one
+                        // the sequential path builds: first byte low, second
+                        // byte high.
+                        imm_r   <= {fetch_peek[1], fetch_peek[0]};
+                        ip_next <= ip_next + 16'd2;
+                        imm_idx <= 2'd0;
+                        state   <= rm_mem ? S_EA : S_PREP;
+                    end else if (fetch_valid) begin
                         ip_next <= ip_next + 16'd1;
                         case (imm_idx)
                             2'd0: imm_r <= imm_sext ? {{8{fetch_data[7]}}, fetch_data}

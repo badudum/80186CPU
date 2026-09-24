@@ -101,6 +101,14 @@ module tb_bios;
 
     localparam logic [5:0] ST_FETCH_OP = 6'd1;
     int dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
+    int unk_occ = 0, unk_empty = 0, unk_after_flush = 0;
+    // Cycles the sequencer spends in FETCH_OP with nothing to decode. This
+    // is the direct cost of the queue being empty, as opposed to the count
+    // of instructions that merely started that way.
+    int fetch_starved = 0, fetch_total = 0, starved_after_flush = 0;
+    int flush_age = 999;
+    logic flushed_recently;
+    assign flushed_recently = (flush_age < 12);
     logic       dl_armed = 1'b0;
     logic [2:0] dl_pred;
     logic [7:0] dl_b [0:5];
@@ -123,8 +131,24 @@ module tb_bios;
             end else begin
                 dl_armed = 1'b0;
                 dl_unknown++;
+                // WHY isn't it ready? Deepening the queue only helps if the
+                // answer is "the queue was full and the instruction is long".
+                // If it is "the queue was just flushed by a branch", depth is
+                // irrelevant and the fix is somewhere else entirely.
+                unk_occ = unk_occ + dl_count;
+                if (dl_count == 0) unk_empty++;
+                if (flushed_recently) unk_after_flush++;
             end
         end
+        if (dut.u_cpu.u_eu.u_exec.state == ST_FETCH_OP && !dut.halted) begin
+            fetch_total++;
+            if (dut.u_cpu.u_biu.u_pq.count == 0) begin
+                fetch_starved++;
+                if (flushed_recently) starved_after_flush++;
+            end
+        end
+        if (dut.u_cpu.u_biu.u_pq.flush) flush_age = 0;
+        else if (flush_age < 999)           flush_age = flush_age + 1;
         if (dl_armed) dl_bytes = dl_bytes + dut.u_cpu.u_biu.u_pq.do_pop;
         if (dut.u_cpu.u_eu.u_exec.state == ST_RETIRE && dl_prev != ST_RETIRE) begin
             if (dl_armed) begin
@@ -482,6 +506,12 @@ module tb_bios;
         $display("");
         $display("  decode_len shadow: %0d checked, %0d mismatched, %0d unknowable",
                  dl_checked, dl_mismatch, dl_unknown);
+        $display("  FETCH_OP: %0d cycles, %0d of them with an empty queue (%0.1f%%), %0d just after a flush",
+                 fetch_total, fetch_starved,
+                 100.0 * fetch_starved / fetch_total, starved_after_flush);
+        if (dl_unknown > 0)
+            $display("  of the unknowable: avg queue %0.2f bytes, %0d totally empty, %0d within 12 cycles of a flush",
+                     real'(unk_occ) / real'(dl_unknown), unk_empty, unk_after_flush);
         $display("");
         $display("==================================");
         $display(" checks: %0d   failures: %0d", checks, errors);

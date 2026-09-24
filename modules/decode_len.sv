@@ -45,6 +45,11 @@ module decode_len
     output logic        valid,        // enough bytes present to know the length
     output logic [2:0]  len,          // total bytes, prefixes included
     output logic [2:0]  n_prefix,     // how many of those are prefixes
+    // The shape of the instruction ABOUT to be read, as opposed to the
+    // registered opcode, which still describes the previous one. This is
+    // what lets the sequencer skip states that would only transition.
+    output logic        op_has_modrm,
+    output logic [2:0]  op_imm_bytes,
     output logic        has_rep,
     output logic        has_seg_ovr,
     output logic [1:0]  seg_ovr
@@ -161,6 +166,9 @@ module decode_len
     // happen: the length is KNOWN once the opcode and any ModR/M have
     // arrived, but the instruction is only CONSUMABLE once all of it has.
     // A caller that pops on "known" would run past the tail.
+    assign op_has_modrm = d_has_modrm;
+    assign op_imm_bytes = d_imm_bytes;
+
     assign valid = (count >= need_for_len) && (count >= total) && (total <= 4'd6);
     assign len   = total[2:0];
 

@@ -62,7 +62,11 @@ module biu (
     input  logic        fetch_set,    // redirect + flush the queue
     output logic [7:0]  fetch_data,
     output logic        fetch_valid,
-    input  logic        fetch_pop,
+    // The sequencer asks for a whole instruction's worth at a time now, and
+    // looks ahead with `peek` to decide how much that is.
+    input  logic [2:0]  fetch_pop_n,
+    output logic [7:0]  fetch_peek [0:5],
+    output logic [3:0]  fetch_count,
 
     // ---- data access, from the EU ----
     input  logic        req,          // hold high until req_done
@@ -138,7 +142,6 @@ module biu (
     logic        pq_write_en, pq_write_word, pq_space;
     logic [15:0] pq_write_data;
 
-    logic [7:0] pq_peek [0:5];        // not used yet; see prefetch_queue.sv
     prefetch_queue u_pq (
         .clk             (clk),
         .rst_n           (rst_n),
@@ -146,15 +149,12 @@ module biu (
         .write_data      (pq_write_data),
         .write_word      (pq_write_word),
         .space_available (pq_space),
-        // One byte at a time for now: the EU still consumes the instruction
-        // byte by byte. The decode stage is what will start asking for a
-        // whole instruction's worth in one cycle.
-        .pop_n           (fetch_pop ? 3'd1 : 3'd0),
-        .peek            (pq_peek),
+        .pop_n           (fetch_pop_n),
+        .peek            (fetch_peek),
         .pop_data        (fetch_data),
         .pop_valid       (fetch_valid),
         .flush           (fetch_set),
-        .count           ()
+        .count           (fetch_count)
     );
 
     // =====================================================================

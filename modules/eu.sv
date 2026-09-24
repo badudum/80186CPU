@@ -20,7 +20,9 @@ module eu
     // instruction bytes from the BIU
     input  logic [7:0]  fetch_data,
     input  logic        fetch_valid,
-    output logic        fetch_pop,
+    output logic [2:0]  fetch_pop_n,
+    input  logic [7:0]  fetch_peek [0:5],
+    input  logic [3:0]  fetch_count,
     output logic        fetch_set,
     output logic [19:0] fetch_addr,
 
@@ -184,7 +186,9 @@ module eu
         .rst_n         (rst_n),
         .fetch_data    (fetch_data),
         .fetch_valid   (fetch_valid),
-        .fetch_pop     (fetch_pop),
+        .fetch_pop_n   (fetch_pop_n),
+        .fetch_peek    (fetch_peek),
+        .fetch_count   (fetch_count),
         .fetch_set     (fetch_set),
         .fetch_addr    (fetch_addr),
         .req           (req),

@@ -91,7 +91,10 @@ module cpu_top
 );
 
     logic [7:0]  fetch_data;
-    logic        fetch_valid, fetch_pop, fetch_set;
+    logic        fetch_valid, fetch_set;
+    logic [2:0]  fetch_pop_n;          // bytes the EU retires this cycle
+    logic [7:0]  fetch_peek [0:5];     // queue contents, oldest first
+    logic [3:0]  fetch_count;
     logic [19:0] fetch_addr;
 
     // EU request port
@@ -204,7 +207,9 @@ module cpu_top
         .fetch_set   (fetch_set),
         .fetch_data  (fetch_data),
         .fetch_valid (fetch_valid),
-        .fetch_pop   (fetch_pop),
+        .fetch_pop_n (fetch_pop_n),
+        .fetch_peek  (fetch_peek),
+        .fetch_count (fetch_count),
         .req         (biu_req),
         .req_wr      (biu_req_wr),
         .req_io      (biu_req_io),
@@ -336,7 +341,9 @@ module cpu_top
         .rst_n         (rst_n),
         .fetch_data    (fetch_data),
         .fetch_valid   (fetch_valid),
-        .fetch_pop     (fetch_pop),
+        .fetch_pop_n   (fetch_pop_n),
+        .fetch_peek    (fetch_peek),
+        .fetch_count   (fetch_count),
         .fetch_set     (fetch_set),
         .fetch_addr    (fetch_addr),
         .req           (req),

@@ -11,6 +11,12 @@ module tb_biu;
     logic        fetch_set = 0;
     logic [7:0]  fetch_data;
     logic        fetch_valid, fetch_pop = 0;
+    // The queue consumes by count now; this testbench still thinks in single
+    // bytes, so `fetch_pop` stays as its shorthand.
+    logic [2:0]  fetch_pop_n;
+    logic [7:0]  fetch_peek [0:5];
+    logic [3:0]  fetch_count;
+    assign fetch_pop_n = fetch_pop ? 3'd1 : 3'd0;
     logic        req = 0, req_wr = 0, req_io = 0, req_word = 0;
     logic [19:0] req_addr = 0;
     logic [15:0] req_wdata = 0, req_rdata;

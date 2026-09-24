@@ -15,6 +15,8 @@ module tb_decode_len;
     logic [3:0] count;
     logic       valid;
     logic [2:0] len, n_prefix;
+    logic       op_has_modrm;
+    logic [2:0] op_imm_bytes;
     logic       has_rep, has_seg_ovr;
     logic [1:0] seg_ovr;
 
@@ -150,19 +152,19 @@ module tb_decode_len;
         $display("  probe: opcode -> has_modrm disp_bytes imm_bytes len");
         put(6, 'hFC,0,0,0,0,0);
         $display("    FC CLD      %0d %0d %0d  len=%0d",
-                 dut.d_has_modrm, dut.d_disp_bytes, dut.d_imm_bytes, len);
+                 op_has_modrm, dut.d_disp_bytes, op_imm_bytes, len);
         put(6, 'h50,0,0,0,0,0);
         $display("    50 PUSH AX  %0d %0d %0d  len=%0d",
-                 dut.d_has_modrm, dut.d_disp_bytes, dut.d_imm_bytes, len);
+                 op_has_modrm, dut.d_disp_bytes, op_imm_bytes, len);
         put(6, 'h58,0,0,0,0,0);
         $display("    58 POP AX   %0d %0d %0d  len=%0d",
-                 dut.d_has_modrm, dut.d_disp_bytes, dut.d_imm_bytes, len);
+                 op_has_modrm, dut.d_disp_bytes, op_imm_bytes, len);
         put(6, 'hAB,0,0,0,0,0);
         $display("    AB STOSW    %0d %0d %0d  len=%0d",
-                 dut.d_has_modrm, dut.d_disp_bytes, dut.d_imm_bytes, len);
+                 op_has_modrm, dut.d_disp_bytes, op_imm_bytes, len);
         put(6, 'hB8,'h40,'h00,0,0,0);
         $display("    B8 MOV AX   %0d %0d %0d  len=%0d",
-                 dut.d_has_modrm, dut.d_disp_bytes, dut.d_imm_bytes, len);
+                 op_has_modrm, dut.d_disp_bytes, op_imm_bytes, len);
 
         $display("");
         $display("==================================");
