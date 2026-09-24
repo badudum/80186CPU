@@ -77,8 +77,6 @@ module tb_bios;
         prev_exec <= dut.u_cpu.u_eu.u_exec.state;
     end
 
-    // ---- decode_len shadow, fast iteration ----
-    // Same check tb_msdos runs, here because this testbench finishes in a
     // minute rather than eleven. Prints the offending bytes, which is the
     // only way to tell a wrong rule from a wrong measurement.
     logic [7:0] dl_peek [0:5];
@@ -100,57 +98,77 @@ module tb_bios;
     );
 
     localparam logic [5:0] ST_FETCH_OP = 6'd1;
-    int dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
-    int unk_occ = 0, unk_empty = 0, unk_after_flush = 0;
-    // Cycles the sequencer spends in FETCH_OP with nothing to decode. This
-    // is the direct cost of the queue being empty, as opposed to the count
-    // of instructions that merely started that way.
-    int fetch_starved = 0, fetch_total = 0, starved_after_flush = 0;
-    // Is the whole-instruction capture actually being taken?
-    int fast_hits = 0, fetch_entries = 0;
-    int blk_prefix = 0, blk_int = 0, blk_invalid = 0;
-    int flush_age = 999;
+    int  dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
+    int  unk_occ = 0, unk_empty = 0, unk_after_flush = 0;
+    int  fetch_starved = 0, fetch_total = 0, starved_after_flush = 0;
+    int  fast_hits = 0, fetch_entries = 0;
+    int  blk_prefix = 0, blk_int = 0, blk_invalid = 0;
+    int  flush_age = 999;
     logic flushed_recently;
     assign flushed_recently = (flush_age < 12);
-    logic       dl_armed = 1'b0;
-    logic [2:0] dl_pred;
-    logic [7:0] dl_b [0:5];
-    int         dl_bytes;
     logic [5:0] dl_prev = 6'd0;
 
-    // The #1 is not cosmetic. dl_peek is driven by an always_comb and
-    // decode_len's outputs are another delta behind it, so reading them from
-    // a different always block at the same instant samples stale values --
-    // which showed up as a one-byte instruction being predicted as three.
+    // ---- is the instruction stream still in step? ----
+    // The earlier version of this counted bytes between S_FETCH_OP entries.
+    // That stopped working the moment an instruction could also begin in
+    // S_RETIRE: the counter ran on into the next instruction and reported
+    // 49,027 mismatches that were all the harness losing the boundary, not
+    // the decoder being wrong.
+    //
+    // Addresses do not care which state started the instruction. Each time a
+    // whole instruction is captured, the address it starts at must be the
+    // previous instruction's start plus the length claimed for it. If that
+    // ever fails, the queue head has moved to the wrong byte and everything
+    // after it decodes from garbage -- which is the thing worth detecting.
+    //
+    // Anything that redirects the fetch breaks the chain legitimately, so a
+    // flush since the last capture skips the comparison rather than failing
+    // it.
+    // Every instruction start is tracked, not just the captured ones: when
+    // the fast path does not fire the instruction still executes, and a
+    // chain that only linked captures skipped over it and reported a gap
+    // that was not a desynchronisation at all.
+    //
+    // instr_start_ip is written by BOTH paths, so a change in it is an
+    // instruction boundary regardless of which state began it. The length is
+    // only known for captured instructions, so the check runs for those and
+    // is skipped for the rest.
+    logic [15:0] last_start = 16'hFFFF;
+    logic [2:0]  last_len;
+    logic        have_len = 1'b0, jumped = 1'b0;
+
     always @(negedge dut.clk_cpu) begin
         #1;
-        if (dut.u_cpu.u_eu.u_exec.state == ST_FETCH_OP && dl_prev != ST_FETCH_OP
-            && !dut.u_cpu.u_eu.u_exec.prefix_seen) begin
-            dl_bytes = 0;
-            if (dl_valid) begin
-                dl_armed = 1'b1;
-                dl_pred  = dl_len;
-                for (int i = 0; i < 6; i++) dl_b[i] = dl_peek[i];
-            end else begin
-                dl_armed = 1'b0;
-                dl_unknown++;
-                // WHY isn't it ready? Deepening the queue only helps if the
-                // answer is "the queue was full and the instruction is long".
-                // If it is "the queue was just flushed by a branch", depth is
-                // irrelevant and the fix is somewhere else entirely.
-                unk_occ = unk_occ + dl_count;
-                if (dl_count == 0) unk_empty++;
-                if (flushed_recently) unk_after_flush++;
+        // The RTL reports the length of the instruction it started, written
+        // by the same edge as instr_start_ip, so nothing here has to infer
+        // it from cycle timing. An earlier version did infer it and
+        // attributed one instruction's length to another.
+        if (dut.u_cpu.u_eu.u_exec.instr_start_ip !== last_start) begin
+            if (have_len && !jumped) begin
+                dl_checked++;
+                if (dut.u_cpu.u_eu.u_exec.instr_start_ip !== (last_start + {13'd0, last_len})) begin
+                    if (dl_mismatch < 6)
+                        $display("  DL DESYNC: %04h + %0d should be next, got %04h",
+                                 last_start, last_len, dut.u_cpu.u_eu.u_exec.instr_start_ip);
+                    dl_mismatch++;
+                end
             end
+            last_start = dut.u_cpu.u_eu.u_exec.instr_start_ip;
+            last_len   = dut.u_cpu.u_eu.u_exec.cap_len_dbg;
+            have_len   = dut.u_cpu.u_eu.u_exec.cap_valid_dbg;
+            jumped     = 1'b0;
         end
+        if (dut.u_cpu.u_eu.u_exec.fetch_set) jumped = 1'b1;
+
+        // How often the whole-instruction capture is available, and why not.
         if (dut.u_cpu.u_eu.u_exec.state == ST_FETCH_OP && !dut.halted) begin
             fetch_total++;
             if (dl_prev != ST_FETCH_OP) begin
                 fetch_entries++;
-                if (dut.u_cpu.u_eu.u_exec.fast_take) fast_hits++;
-                else if (dut.u_cpu.u_eu.u_exec.prefix_seen)   blk_prefix++;
+                if (dut.u_cpu.u_eu.u_exec.fast_take)                        fast_hits++;
+                else if (dut.u_cpu.u_eu.u_exec.prefix_seen)                 blk_prefix++;
                 else if (dut.u_cpu.u_eu.u_exec.hw_int_ready ||
-                         dut.u_cpu.u_eu.u_exec.block_int_once) blk_int++;
+                         dut.u_cpu.u_eu.u_exec.block_int_once)              blk_int++;
                 else if (!dl_valid)                            blk_invalid++;
             end
             if (dut.u_cpu.u_biu.u_pq.count == 0) begin
@@ -159,21 +177,7 @@ module tb_bios;
             end
         end
         if (dut.u_cpu.u_biu.u_pq.flush) flush_age = 0;
-        else if (flush_age < 999)           flush_age = flush_age + 1;
-        if (dl_armed) dl_bytes = dl_bytes + dut.u_cpu.u_biu.u_pq.do_pop;
-        if (dut.u_cpu.u_eu.u_exec.state == ST_RETIRE && dl_prev != ST_RETIRE) begin
-            if (dl_armed) begin
-                dl_checked++;
-                if (dl_bytes != {29'd0, dl_pred}) begin
-                    if (dl_mismatch < 12)
-                        $display("  DL MISMATCH pred=%0d popped=%0d bytes: %02h %02h %02h %02h %02h %02h",
-                                 dl_pred, dl_bytes,
-                                 dl_b[0], dl_b[1], dl_b[2], dl_b[3], dl_b[4], dl_b[5]);
-                    dl_mismatch++;
-                end
-            end
-            dl_armed = 1'b0;
-        end
+        else if (flush_age < 999)       flush_age = flush_age + 1;
         dl_prev = dut.u_cpu.u_eu.u_exec.state;
     end
 
@@ -515,16 +519,15 @@ module tb_bios;
                  100.0 * bus_cycles / busy_cycles,
                  100.0 * stall_ram / busy_cycles);
         $display("");
-        $display("  decode_len shadow: %0d checked, %0d mismatched, %0d unknowable",
-                 dl_checked, dl_mismatch, dl_unknown);
-        $display("  fast path: %0d of %0d entries took it; blocked by prefix %0d, interrupt %0d, not queued %0d",
-                 fast_hits, fetch_entries, blk_prefix, blk_int, blk_invalid);
-        $display("  FETCH_OP: %0d cycles, %0d of them with an empty queue (%0.1f%%), %0d just after a flush",
-                 fetch_total, fetch_starved,
-                 100.0 * fetch_starved / fetch_total, starved_after_flush);
         if (dl_unknown > 0)
             $display("  of the unknowable: avg queue %0.2f bytes, %0d totally empty, %0d within 12 cycles of a flush",
                      real'(unk_occ) / real'(dl_unknown), unk_empty, unk_after_flush);
+        $display("  instruction stream: %0d captures checked, %0d desynchronised",
+                 dl_checked, dl_mismatch);
+        $display("  fast path: %0d of %0d entries took it; blocked by prefix %0d, interrupt %0d, not queued %0d",
+                 fast_hits, fetch_entries, blk_prefix, blk_int, blk_invalid);
+        $display("  FETCH_OP: %0d cycles, %0d with an empty queue, %0d just after a flush",
+                 fetch_total, fetch_starved, starved_after_flush);
         $display("");
         $display("==================================");
         $display(" checks: %0d   failures: %0d", checks, errors);

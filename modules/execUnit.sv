@@ -65,6 +65,49 @@
 // dbg_int_type shows the type when one does not.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// START_INSTR -- clear the per-instruction state and capture a whole
+// instruction from the queue.
+//
+// A MACRO, DELIBERATELY. This runs from two different states: S_FETCH_OP for
+// the ordinary case, and S_RETIRE when the previous instruction's last cycle
+// can be shared with the next one's decode. The body is a sixteen-register
+// clear list followed by the field capture, and two hand-maintained copies of
+// that list would drift -- one of them would gain a register the other did
+// not, and the symptom would be an instruction inheriting stale control from
+// whichever one it happened to start from.
+// ---------------------------------------------------------------------------
+`define START_INSTR                                   \
+    second_byte    <= 1'b0;                           \
+    do_jump        <= 1'b0;                           \
+    wb_en          <= 1'b0;                           \
+    wb_hi_en       <= 1'b0;                           \
+    call_mode      <= 1'b0;                           \
+    pop_to_flags   <= 1'b0;                           \
+    pop_to_sreg    <= 1'b0;                           \
+    pop_to_rm      <= 1'b0;                           \
+    flags_mask_r   <= FM_NONE;                        \
+    seg_r          <= SR_DS;                          \
+    int_taken_r    <= 1'b0;                           \
+    int_from_intr  <= 1'b0;                           \
+    imm_idx        <= 2'd0;                           \
+    seq_far        <= 1'b0;                           \
+    opcode_r       <= dl_op;                          \
+    modrm_r        <= dl_modrm;                       \
+    disp_r         <= dl_disp;                        \
+    imm_r          <= dl_imm;                         \
+    imm2_r         <= dl_imm2;                        \
+    seg_ovr_en     <= dl_segovr_en;                   \
+    seg_ovr        <= dl_segovr;                      \
+    rep_en         <= dl_rep;                         \
+    rep_z          <= dl_rep_z;                       \
+    instr_start_ip <= ip_next;                        \
+    cap_len_dbg    <= dl_len;                         \
+    cap_valid_dbg  <= 1'b1;                           \
+    ip_next        <= ip_next + {13'd0, dl_len};      \
+    prefix_seen    <= 1'b0;                           \
+    state          <= dl_rm_mem ? S_EA : S_PREP;
+
 `timescale 1ns/1ns
 module execUnit
     import cpu_pkg::*;
@@ -377,9 +420,33 @@ module execUnit
     //   instruction. The existing priority has to be preserved exactly or
     //   interrupts get accepted one instruction late, which is the sort of
     //   thing that shows up as a hang under load and nowhere else.
-    logic fast_take;
-    assign fast_take = (state == S_FETCH_OP) && dl_valid
-                       && !prefix_seen && !block_int_once && !hw_int_ready;
+    // OVERLAPPING RETIRE WITH THE NEXT INSTRUCTION. S_RETIRE writes IP and
+    // flags for the instruction that is finishing and does nothing else, so
+    // the cycle is free to start the next one -- two instructions in the
+    // machine at once, which is the whole point of the exercise. On the
+    // MS-DOS boot S_RETIRE is 5.3% of all cycles and S_FETCH_OP another
+    // 12.3%; this removes one of them for every instruction where the next
+    // one is already in the queue.
+    //
+    // Not when do_jump is set: the next instruction is then at the branch
+    // target, not at ip_next, and the queue still holds the fall-through
+    // bytes. That case goes through S_REDIRECT as before.
+    // VERIFICATION SUPPORT. instr_start_ip says where the current
+    // instruction begins; these say how long it was and whether the length
+    // was known at all. A testbench trying to reconstruct that from cycle
+    // timing gets it wrong -- the overlap means a capture and an instruction
+    // boundary can land in the same cycle, and stitching the two together
+    // after the fact attributes one instruction's length to another. Both
+    // are written by the same edge that writes instr_start_ip, so they are
+    // consistent by construction.
+    logic [2:0] cap_len_dbg;
+    logic       cap_valid_dbg;
+
+    logic fast_here, fast_take;
+    assign fast_here = dl_valid && !prefix_seen && !block_int_once
+                       && !hw_int_ready;
+    assign fast_take = fast_here && ((state == S_FETCH_OP)
+                                     || (state == S_RETIRE && !do_jump));
 
 
     // The byte-at-a-time path still drives a single-byte pop; the fast path
@@ -1222,6 +1289,7 @@ module execUnit
 
                 // ---------- instruction byte fetch ----------
                 S_FETCH_OP: begin
+                    cap_valid_dbg <= 1'b0;   // a slow-path start has no length
                     disp_r       <= 16'h0000;
                     imm_r        <= 16'h0000;
                     second_byte  <= 1'b0;
@@ -1259,19 +1327,7 @@ module execUnit
                     // a prefix and its instruction, so the check below is
                     // skipped once any prefix has been seen.
                     if (fast_take) begin
-                        opcode_r       <= dl_op;
-                        modrm_r        <= dl_modrm;
-                        disp_r         <= dl_disp;
-                        imm_r          <= dl_imm;
-                        imm2_r         <= dl_imm2;
-                        seg_ovr_en     <= dl_segovr_en;
-                        seg_ovr        <= dl_segovr;
-                        rep_en         <= dl_rep;
-                        rep_z          <= dl_rep_z;
-                        instr_start_ip <= ip_next;
-                        ip_next        <= ip_next + {13'd0, dl_len};
-                        prefix_seen    <= 1'b0;
-                        state          <= dl_rm_mem ? S_EA : S_PREP;
+                        `START_INSTR
                     end else if (fetch_valid && fetch_is_prefix) begin
                         ip_next     <= ip_next + 16'd1;
                         prefix_seen <= 1'b1;
@@ -2025,7 +2081,13 @@ module execUnit
 
                 S_WB_HI: state <= S_RETIRE;
 
-                S_RETIRE: state <= do_jump ? S_REDIRECT : S_FETCH_OP;
+                S_RETIRE: begin
+                    if (fast_take) begin
+                        `START_INSTR
+                    end else begin
+                        state <= do_jump ? S_REDIRECT : S_FETCH_OP;
+                    end
+                end
 
                 S_REDIRECT: begin
                     early_fetch <= 1'b0;

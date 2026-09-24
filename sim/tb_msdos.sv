@@ -179,55 +179,86 @@ module tb_msdos;
     );
 
     localparam logic [5:0] ST_FETCH_OP = 6'd1;
-    int dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
-    logic       dl_armed = 1'b0;
-    logic [2:0] dl_pred;
-    int         dl_bytes;
+    int  dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
+    int  unk_occ = 0, unk_empty = 0, unk_after_flush = 0;
+    int  fetch_starved = 0, fetch_total = 0, starved_after_flush = 0;
+    int  fast_hits = 0, fetch_entries = 0;
+    int  blk_prefix = 0, blk_int = 0, blk_invalid = 0;
+    int  flush_age = 999;
+    logic flushed_recently;
+    assign flushed_recently = (flush_age < 12);
     logic [5:0] dl_prev = 6'd0;
 
-    // SAMPLED ON THE NEGEDGE, and counting bytes rather than inferring them
-    // from IP. Two reasons, both of which produced a false 13% mismatch rate
-    // on the first attempt:
+    // ---- is the instruction stream still in step? ----
+    // The earlier version of this counted bytes between S_FETCH_OP entries.
+    // That stopped working the moment an instruction could also begin in
+    // S_RETIRE: the counter ran on into the next instruction and reported
+    // 49,027 mismatches that were all the harness losing the boundary, not
+    // the decoder being wrong.
     //
-    //   Reading `state` on the posedge races its own non-blocking update, so
-    //   the state was a cycle stale while the combinational queue read was
-    //   not. Everything has settled by the negedge.
+    // Addresses do not care which state started the instruction. Each time a
+    // whole instruction is captured, the address it starts at must be the
+    // previous instruction's start plus the length claimed for it. If that
+    // ever fails, the queue head has moved to the wrong byte and everything
+    // after it decodes from garbage -- which is the thing worth detecting.
     //
-    //   IP movement is a proxy for length, not length itself. Counting what
-    //   the queue actually retired measures exactly what decode_len claims.
-    // The #1 is not cosmetic. dl_peek is driven by an always_comb and
-    // decode_len's outputs are another delta behind it, so reading them from
-    // a different always block at the same instant samples stale values --
-    // which showed up as a one-byte instruction being predicted as three.
+    // Anything that redirects the fetch breaks the chain legitimately, so a
+    // flush since the last capture skips the comparison rather than failing
+    // it.
+    // Every instruction start is tracked, not just the captured ones: when
+    // the fast path does not fire the instruction still executes, and a
+    // chain that only linked captures skipped over it and reported a gap
+    // that was not a desynchronisation at all.
+    //
+    // instr_start_ip is written by BOTH paths, so a change in it is an
+    // instruction boundary regardless of which state began it. The length is
+    // only known for captured instructions, so the check runs for those and
+    // is skipped for the rest.
+    logic [15:0] last_start = 16'hFFFF;
+    logic [2:0]  last_len;
+    logic        have_len = 1'b0, jumped = 1'b0;
+
     always @(negedge dut.clk_cpu) begin
         #1;
-        if (`EXEC.state == ST_FETCH_OP && dl_prev != ST_FETCH_OP
-            && !`EXEC.prefix_seen) begin
-            dl_bytes = 0;
-            if (dl_valid) begin
-                dl_armed = 1'b1;
-                dl_pred  = dl_len;
-            end else begin
-                dl_armed = 1'b0;          // length not yet determinable
-                dl_unknown++;
-            end
-        end
-
-        // do_pop is what the queue will retire on the coming edge.
-        if (dl_armed) dl_bytes = dl_bytes + dut.u_cpu.u_biu.u_pq.do_pop;
-
-        if (`EXEC.state == ST_RETIRE && dl_prev != ST_RETIRE) begin
-            if (dl_armed) begin
+        // The RTL reports the length of the instruction it started, written
+        // by the same edge as instr_start_ip, so nothing here has to infer
+        // it from cycle timing. An earlier version did infer it and
+        // attributed one instruction's length to another.
+        if (`EXEC.instr_start_ip !== last_start) begin
+            if (have_len && !jumped) begin
                 dl_checked++;
-                if (dl_bytes != {29'd0, dl_pred}) begin
-                    if (dl_mismatch < 10)
-                        $display("  DECODE_LEN MISMATCH: predicted %0d, queue retired %0d",
-                                 dl_pred, dl_bytes);
+                if (`EXEC.instr_start_ip !== (last_start + {13'd0, last_len})) begin
+                    if (dl_mismatch < 6)
+                        $display("  DL DESYNC: %04h + %0d should be next, got %04h",
+                                 last_start, last_len, `EXEC.instr_start_ip);
                     dl_mismatch++;
                 end
             end
-            dl_armed = 1'b0;
+            last_start = `EXEC.instr_start_ip;
+            last_len   = `EXEC.cap_len_dbg;
+            have_len   = `EXEC.cap_valid_dbg;
+            jumped     = 1'b0;
         end
+        if (`EXEC.fetch_set) jumped = 1'b1;
+
+        // How often the whole-instruction capture is available, and why not.
+        if (`EXEC.state == ST_FETCH_OP && !dut.halted) begin
+            fetch_total++;
+            if (dl_prev != ST_FETCH_OP) begin
+                fetch_entries++;
+                if (`EXEC.fast_take)                        fast_hits++;
+                else if (`EXEC.prefix_seen)                 blk_prefix++;
+                else if (`EXEC.hw_int_ready ||
+                         `EXEC.block_int_once)              blk_int++;
+                else if (!dl_valid)                            blk_invalid++;
+            end
+            if (dut.u_cpu.u_biu.u_pq.count == 0) begin
+                fetch_starved++;
+                if (flushed_recently) starved_after_flush++;
+            end
+        end
+        if (dut.u_cpu.u_biu.u_pq.flush) flush_age = 0;
+        else if (flush_age < 999)       flush_age = flush_age + 1;
         dl_prev = `EXEC.state;
     end
 
@@ -653,10 +684,14 @@ module tb_msdos;
                  stall_other, 100.0 * stall_other / cycles);
         $display(" %0d instructions in %0d running cycles -- CPI %0.2f",
                  retired, busy_cycles, real'(busy_cycles) / real'(retired));
+        $display("  instruction stream: %0d captures checked, %0d desynchronised",
+                 dl_checked, dl_mismatch);
+        $display("  fast path: %0d of %0d entries took it; blocked by prefix %0d, interrupt %0d, not queued %0d",
+                 fast_hits, fetch_entries, blk_prefix, blk_int, blk_invalid);
+        $display("  FETCH_OP: %0d cycles, %0d with an empty queue, %0d just after a flush",
+                 fetch_total, fetch_starved, starved_after_flush);
         dump_states();
         $display("");
-        $display(" decode_len shadow: %0d checked, %0d mismatched, %0d not yet knowable",
-                 dl_checked, dl_mismatch, dl_unknown);
         show_regs();
         // The loop it is sitting in, for an offline disassembly.
         dump_mem(int'(cs_now) * 16 + int'(ip_now) - 128, 256);
