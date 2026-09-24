@@ -92,6 +92,7 @@ module tb_bios;
 
     string got;
     int i, r, glyph_bits;
+    logic [15:0] bda, tail_before, tail_after, kb_entry;
 
     // ---- PS/2 frame injection, straight at the board pins ----
     task ps2_bit(input logic b);
@@ -105,7 +106,7 @@ module tb_bios;
         end
     endtask
 
-    task ps2_key(input [7:0] code);
+    task ps2_byte(input [7:0] code);
         logic p;
         begin
             p = ~(^code);                  // odd parity
@@ -114,6 +115,20 @@ module tb_bios;
             ps2_bit(p);
             ps2_bit(1'b1);
             repeat (60) @(posedge CLOCK_50);
+        end
+    endtask
+
+    // A REAL KEYSTROKE, press and release. This used to send only the make
+    // code, which is not what a keyboard does and is not what the BIOS has to
+    // cope with: every key also sends a release, and the handler has to
+    // recognise and discard it. Testing only the press left the entire
+    // release path unexercised through the BIOS -- so a bug that made typing
+    // lag several characters behind could pass every test here.
+    task ps2_key(input [7:0] code);
+        begin
+            ps2_byte(code);                // make
+            ps2_byte(8'hF0);               // break prefix (set 2, off the wire)
+            ps2_byte(code);                // ...and the code again
         end
     endtask
 
@@ -155,6 +170,58 @@ module tb_bios;
         // on hardware and dominates this wait.
         while (i < 5000000) begin @(negedge CLOCK_50); i++; end
         chk("machine reached the boot sector's HLT", dut.halted, 1'b1);
+
+        // ---- modifier state, and keys that have no ASCII ----
+        // The machine is halted, but HLT wakes on an interrupt, so INT 09h
+        // still runs and nothing is consuming the buffer any more -- which
+        // makes this the easiest place to look at what the handler actually
+        // stored.
+        //
+        // Ctrl and Alt were never tracked at all: only Shift wrote 40:17, so
+        // INT 16h AH=02 reported them permanently released and QBASIC, which
+        // opens its menus with Alt, could not be driven.
+        ps2_byte(8'h14);                        // Ctrl down (set 2 14 -> 1D)
+        repeat (4000) @(posedge CLOCK_50);
+        bda = chip.mem['h416 >> 1];
+        chk("Ctrl sets bit 2 of 40:17", bda[15:8] & 8'h04, 8'h04);
+
+        ps2_byte(8'h11);                        // Alt down (set 2 11 -> 38)
+        repeat (4000) @(posedge CLOCK_50);
+        bda = chip.mem['h416 >> 1];
+        chk("Alt sets bit 3, Ctrl still held", bda[15:8] & 8'h0C, 8'h0C);
+
+        ps2_byte(8'hF0); ps2_byte(8'h11);       // Alt up
+        repeat (4000) @(posedge CLOCK_50);
+        bda = chip.mem['h416 >> 1];
+        chk("releasing Alt clears only its bit", bda[15:8] & 8'h0C, 8'h04);
+
+        ps2_byte(8'hF0); ps2_byte(8'h14);       // Ctrl up
+        repeat (4000) @(posedge CLOCK_50);
+        bda = chip.mem['h416 >> 1];
+        chk("releasing Ctrl clears bit 2", bda[15:8] & 8'h04, 8'h00);
+
+        // A modifier must not deliver a keystroke of its own.
+        tail_before = chip.mem['h41C >> 1];
+        ps2_byte(8'h12); ps2_byte(8'hF0); ps2_byte(8'h12);   // shift, tapped
+        repeat (6000) @(posedge CLOCK_50);
+        chk("tapping Shift enqueued nothing", chip.mem['h41C >> 1], tail_before);
+
+        // An arrow has no ASCII, and used to be thrown away for that reason --
+        // which left an editor with no way to move its cursor. A PC BIOS
+        // delivers it as AH = scancode, AL = 00.
+        tail_before = chip.mem['h41C >> 1];
+        ps2_byte(8'hE0); ps2_byte(8'h75);       // Up
+        repeat (6000) @(posedge CLOCK_50);
+        tail_after = chip.mem['h41C >> 1];
+        checks++;
+        if (tail_after === tail_before) begin
+            $display("FAIL an arrow key was dropped instead of enqueued");
+            errors++;
+        end else begin
+            kb_entry = chip.mem[('h400 + tail_before) >> 1];
+            chk("Up arrow delivers scancode 48 with no ASCII",
+                kb_entry, 16'h4800);
+        end
         chk("halt is visible on LEDR[7]", LEDR[7], 1'b1);
         chk("no unexpected trap was taken", dut.dbg_int_taken, 1'b0);
 

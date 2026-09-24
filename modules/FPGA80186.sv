@@ -141,6 +141,8 @@ module FPGA80186 #(
     localparam int REFRESH_DIV    = ((CLK_HZ / 1_000_000) * 15_085) / 1_000;
     // The PC's interval timer runs at 1.193182 MHz.
     localparam int PIT_CLK_DIV    = (CLK_HZ + 596_591) / 1_193_182;
+    // How long the PS/2 receiver waits mid-frame before giving up: 1 ms.
+    localparam int PS2_IDLE       = CLK_HZ / 1000;
 
     logic clk_dram;
     clk_rst #(.PLL_MODE(PLL_MODE)) u_clk_rst (
@@ -494,7 +496,12 @@ module FPGA80186 #(
     assign cpu_din = io_cycle ? io_rdata : mem_rdata;
     assign ready   = io_cycle ? io_ready : mem_ready;
 
-    keyboard_controller u_kbd (
+    // 1 ms: longer than the ~100 us gap between PS/2 bits, shorter than the
+    // gap between keystrokes. This is rate-dependent and was NOT derived from
+    // CLK_HZ when the clock moved to 40 MHz -- the flat 20,000 that had been
+    // 800 us silently became 500 us. It still had margin, which is exactly
+    // why it would have gone unnoticed until a slow keyboard dropped frames.
+    keyboard_controller #(.IDLE_LIMIT(PS2_IDLE)) u_kbd (
         .clk        (clk_cpu),
         .rst_n      (rst_n),
         .ps2_clk    (PS2_CLK),

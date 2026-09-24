@@ -243,6 +243,48 @@ device strobe fires only in a cycle where `ready` is high.
 
 ---
 
+## What a DOS editor needs that a boot prompt does not
+
+Typing at the DOS prompt exercised very little of the keyboard path, and three
+gaps only showed up once QBASIC/EDIT ran.
+
+**Ctrl and Alt were never tracked.** Only the Shift keys wrote the state byte
+at `40:17`, so `INT 16h AH=02` reported Ctrl and Alt permanently released.
+QBASIC opens its menus with Alt, so it could not be driven at all. All three
+now share one set/clear path, with the key carrying the bits it owns — Shift
+`0x03`, Ctrl `0x04`, Alt `0x08`.
+
+**Keys with no ASCII were thrown away.** `INT 09h` discarded anything
+`translate` could not turn into a character, which is every arrow, Home/End,
+PgUp/PgDn and function key — so an editor had no way to move its cursor. A PC
+BIOS delivers those as `AH = scancode, AL = 00`, and programs recognise them
+by the zero. Doom never noticed, because it reads port 60h itself; everything
+going through `INT 16h` did.
+
+The lock keys are now recognised too, but only so they stay *out* of the
+buffer. Their real behaviour is a toggle with an LED, which nothing here
+needs.
+
+**`IDLE_LIMIT` was not scaled with the clock.** The PS/2 receiver abandons a
+partial frame after this many cycles, and it stayed a flat 20,000 when the
+clock moved from 25 to 40 MHz — 800 µs silently became 500 µs. A PS/2 bit gap
+is around 100 µs so it still had margin, which is exactly why it would have
+gone unnoticed until a slow keyboard started dropping frames. It is derived
+from `CLK_HZ` now, like the refresh interval and the timer divisors.
+
+The tests for all three live in `tb_bios`, and they work by letting the
+machine halt and then reading the BDA directly: `HLT` wakes on an interrupt,
+so `INT 09h` still runs while nothing is consuming the buffer.
+
+**Still open: typing in EDIT lags several characters behind.** The hardware
+FIFO drains correctly, `irq` is level and the PIC's external inputs are
+level-sensitive, and the `40:1E` buffer is a correct circular FIFO — so the
+cause is not yet known, and a full press-and-release keystroke through the
+whole BIOS echoes correctly in simulation. The next step is to read `40:1A`
+and `40:1C` on real hardware while typing: a tail running ahead of the head
+puts the fault on the far side of `INT 16h`, and level pointers with missing
+characters put it upstream.
+
 ## Writing to the disk
 
 The disk was read-only for a long time, and the symptom was not "writes are
@@ -408,7 +450,7 @@ are covered by `tools/test_asm86.py`.
 | `INT 11h` / `INT 12h` | equipment word, memory size |
 | `INT 1Ah` | 00 read tick count |
 | `INT 08h` | timer tick, chains to `INT 1Ch` |
-| `INT 09h` | keyboard: set 1 → ASCII into the buffer at 40:1E |
+| `INT 09h` | keyboard: set 1 → ASCII into the buffer at 40:1E; Shift/Ctrl/Alt state at 40:17 |
 | `INT 19h` | bootstrap: load sector 0 to 0000:7C00, check AA55, jump |
 
 Two places it deviates from a PC, both forced by the hardware:

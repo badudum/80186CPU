@@ -785,38 +785,78 @@ a.and_(AL, 0x80)
 a.mov(mem(disp=B_BREAK), AL)
 a.and_(BL, 0x7F)
 
-# Shift keys maintain state on both press and release.
+# ---- modifier keys: state on both press and release ----
+# CTRL AND ALT WERE NEVER TRACKED, only Shift, and the byte at 40:17 is how a
+# program asks. QBASIC opens its menus with Alt and so could not be driven at
+# all: INT 16h AH=02 reported Alt permanently released. BH carries the bits
+# the key owns, 0 meaning "not a modifier", so one piece of set/clear code
+# serves all three.
+#
+# Both Shift keys share bits 0 and 1 rather than owning one each. That is a
+# simplification -- a real BIOS distinguishes them -- but nothing here reads
+# them apart, and holding one Shift while releasing the other is rare enough
+# that the extra state is not worth its bugs.
+a.mov(BH, 0x00)
 a.cmp(BL, 0x2A)                   # left shift
-a.jz("i09_shift")
+a.jz("i09_m_shift")
 a.cmp(BL, 0x36)                   # right shift
-a.jnz("i09_not_shift")
+a.jz("i09_m_shift")
+a.cmp(BL, 0x1D)                   # ctrl (either; E0 1D is the right one)
+a.jz("i09_m_ctrl")
+a.cmp(BL, 0x38)                   # alt (either; E0 38 is the right one)
+a.jz("i09_m_alt")
+a.jmps("i09_not_mod")
 
-a.label("i09_shift")
+a.label("i09_m_shift")
+a.mov(BH, 0x03)
+a.jmps("i09_mod")
+a.label("i09_m_ctrl")
+a.mov(BH, 0x04)
+a.jmps("i09_mod")
+a.label("i09_m_alt")
+a.mov(BH, 0x08)
+
+a.label("i09_mod")
 a.mov(AL, mem(disp=B_BREAK))
 a.cmp(AL, 0)
-a.jnz("i09_shift_up")
+a.jnz("i09_mod_up")
 a.mov(AL, mem(disp=B_SHIFT))
-a.or_(AL, 0x03)
+a.or_(AL, BH)
 a.mov(mem(disp=B_SHIFT), AL)
 a.jmp("i09_done")
-a.label("i09_shift_up")
+a.label("i09_mod_up")
+a.xor(BH, 0xFF)                   # no NOT in the assembler; this is one
 a.mov(AL, mem(disp=B_SHIFT))
-a.and_(AL, 0xFC)
+a.and_(AL, BH)
 a.mov(mem(disp=B_SHIFT), AL)
 a.jmp("i09_done")
 
-a.label("i09_not_shift")
+a.label("i09_not_mod")
+# The lock keys are recognised only so they stay OUT of the buffer. Their
+# real behaviour is a toggle with an LED, which nothing here needs; what
+# matters is that pressing one does not deliver a keystroke.
+a.cmp(BL, 0x3A)                   # caps lock
+a.jz("i09_done")
+a.cmp(BL, 0x45)                   # num lock
+a.jz("i09_done")
+a.cmp(BL, 0x46)                   # scroll lock
+a.jz("i09_done")
+
 # A release of anything else is simply discarded.
 a.mov(AL, mem(disp=B_BREAK))
 a.cmp(AL, 0)
 a.jnz("i09_done")
 
-# Translate and enqueue.
+# ---- translate and enqueue ----
+# A KEY WITH NO ASCII IS STILL A KEY. This used to drop anything `translate`
+# could not turn into a character, which is every arrow, Home/End/PgUp/PgDn
+# and function key -- so an editor had no way to move its cursor. A PC BIOS
+# delivers those as AH = scancode, AL = 00, and programs recognise them by
+# the zero. Doom never noticed because it reads port 60h itself; anything
+# going through INT 16h did.
 a.mov(AL, BL)
 a.call("translate")
-a.cmp(AL, 0)
-a.jz("i09_done")
-a.mov(AH, BL)                     # AH = raw scancode, AL = ASCII
+a.mov(AH, BL)                     # AH = scancode, AL = ASCII (0 if none)
 a.call("kbuf_put")
 
 a.label("i09_done")
