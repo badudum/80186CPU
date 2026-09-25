@@ -86,7 +86,11 @@ module cache #(
     parameter int WAYS       = 8,
     // Next-line prefetch. OFF, because it was measured and it LOSES: see the
     // note above the prefetch logic for the numbers and the reason.
-    parameter bit PREFETCH   = 1'b0
+    parameter bit PREFETCH   = 1'b0,
+    // Posted writes. 0 restores the old behaviour -- the CPU waits for every
+    // write to reach SDRAM -- which is the baseline every measurement of this
+    // is against, and the thing to fall back to if it is ever suspected.
+    parameter int WBUF_DEPTH = 4
 ) (
     input  logic        clk,
     input  logic        rst_n,
@@ -310,12 +314,66 @@ module cache #(
     logic             is_pf;
     logic             pf_abort, pf_start;
 
+    // ---- write buffer ----
+    // WRITE-THROUGH MADE THE CPU WAIT FOR SDRAM ON EVERY STORE. c_ready was
+    // asserted by write_ack, which is m_ready coming back from the memory, so
+    // a store cost a full SDRAM write before the sequencer could move on. On
+    // the MS-DOS boot that is STR_WR spending 48% of its 2.8M cycles waiting,
+    // plus every PUSH and every STORE.
+    //
+    // Nothing needs the CPU to wait. Write-through exists so that no OTHER
+    // master ever sees a stale word, and the ordering that guarantees still
+    // holds if the writes are merely queued: they reach memory in the order
+    // they were issued, just later. So a store now lands in this FIFO and
+    // c_ready goes up in the same cycle, and the FIFO drains whenever the
+    // memory port is otherwise idle.
+    //
+    // THE HAZARD THIS CREATES is a read of an address whose write is still in
+    // the queue. A write that HIT updated the cached copy, so a read that
+    // hits is already correct. A write that MISSED did not -- there is no
+    // write-allocate -- so its only copy is in the queue, and a later read of
+    // that line would fill from SDRAM and get the word before the write.
+    // wb_hazard catches exactly that: a fill whose line matches a queued
+    // write drains first. Line-granular, not word-granular, because the fill
+    // brings in the whole line.
+    //
+    // No foreign-read hazard exists. Per the coherence argument above, the
+    // CPU port is the only master that touches memory below 1 MB, and the CPU
+    // cannot address anything else.
+    localparam int WB_AW = $clog2(WBUF_DEPTH < 2 ? 2 : WBUF_DEPTH);
+
+    logic [19:0]        wb_addr [0:WBUF_DEPTH-1];
+    logic [15:0]        wb_data [0:WBUF_DEPTH-1];
+    logic [1:0]         wb_be   [0:WBUF_DEPTH-1];
+    logic [WB_AW-1:0]   wb_head, wb_tail;
+    logic [WB_AW:0]     wb_cnt;
+
+    logic wb_full, wb_empty, wb_push, wb_pop;
+    assign wb_full  = (wb_cnt == WBUF_DEPTH[WB_AW:0]);
+    assign wb_empty = (wb_cnt == '0);
+
+    // Does a queued write cover the line this fill would bring in?
+    localparam int LINE_LSB = OFF_W + 1;           // byte address -> line
+    logic wb_hazard;
+    always_comb begin
+        wb_hazard = 1'b0;
+        for (int q = 0; q < WBUF_DEPTH; q++)
+            if ((q < int'(wb_cnt)) &&
+                (wb_addr[(wb_head + q[WB_AW-1:0]) % WBUF_DEPTH][19:LINE_LSB]
+                 == c_addr[19:LINE_LSB]))
+                wb_hazard = 1'b1;
+    end
+
     logic hit_now, miss_now, wr_now, fill_ack, fill_last, write_ack;
     logic snoop_flush;
 
     assign hit_now   = (state == S_IDLE) && lu_ok && c_rd && !c_wr &&  hit_any;
-    assign miss_now  = (state == S_IDLE) && lu_ok && c_rd && !c_wr && !hit_any;
+    assign miss_now  = (state == S_IDLE) && lu_ok && c_rd && !c_wr && !hit_any
+                       && !wb_hazard;
     assign wr_now    = (state == S_IDLE) && lu_ok && c_wr;
+    // The store is complete as far as the CPU is concerned the moment it is
+    // queued. Only a full queue makes it wait.
+    assign wb_push   = wr_now && !wb_full;
     // !is_pf is load-bearing: a prefetch must never answer the CPU. fill_ack
     // forwards the word straight out and asserts c_ready, which is right for
     // a demand miss and catastrophic for a prefetch -- a waiting read would
@@ -361,9 +419,11 @@ module cache #(
             m_rd    = !gap;
             m_wr    = 1'b0;
         end else if (state == S_WRITE) begin
-            m_addr  = {4'h0, c_addr};
-            m_wdata = c_wdata;
-            m_be    = c_be;
+            // Draining the queue, so the address comes from its head rather
+            // than from the CPU -- which has long since moved on.
+            m_addr  = {4'h0, wb_addr[wb_head]};
+            m_wdata = wb_data[wb_head];
+            m_be    = wb_be[wb_head];
             m_rd    = 1'b0;
             m_wr    = !gap;
         end else begin
@@ -391,9 +451,13 @@ module cache #(
         wr_en  = 2'b00;
         if (state == S_FILL && m_ready) begin
             wr_en = 2'b11;
-        end else if (write_ack && w_hit) begin
-            wr_sa  = w_sa;
-            wr_way = w_way;
+        end else if (wb_push && hit_any) begin
+            // Updated when the write is QUEUED, not when it reaches memory.
+            // The CPU has been told the store is done, so the cached copy has
+            // to agree from that cycle on -- otherwise a read hit between the
+            // queueing and the draining returns the old word.
+            wr_sa  = r_sa;
+            wr_way = hit_way;
             wr_dat = c_wdata;
             wr_en  = c_be;
         end
@@ -453,8 +517,36 @@ module cache #(
             // touch it -- nobody asked for that line, so it should not count
             // as recently used and push out something that was.
             if (hit_now)                          plru_touch(r_set, hit_way);
-            if (write_ack && w_hit)               plru_touch(r_set, w_way);
+            if (wb_push && hit_any)               plru_touch(r_set, hit_way);
             if (fill_last && !f_poison && !is_pf) plru_touch(f_set, f_way);
+        end
+    end
+
+    // The drain pops as the memory acknowledges; the push happens whenever a
+    // store is accepted, including in the same cycle as a pop.
+    assign wb_pop = (state == S_WRITE) && m_ready;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wb_head <= '0;
+            wb_tail <= '0;
+            wb_cnt  <= '0;
+        end else begin
+            if (wb_push) begin
+                wb_addr[wb_tail] <= c_addr;
+                wb_data[wb_tail] <= c_wdata;
+                wb_be[wb_tail]   <= c_be;
+                wb_tail <= (wb_tail == WBUF_DEPTH[WB_AW-1:0] - 1'b1)
+                           ? '0 : wb_tail + 1'b1;
+            end
+            if (wb_pop)
+                wb_head <= (wb_head == WBUF_DEPTH[WB_AW-1:0] - 1'b1)
+                           ? '0 : wb_head + 1'b1;
+            case ({wb_push, wb_pop})
+                2'b10:   wb_cnt <= wb_cnt + 1'b1;
+                2'b01:   wb_cnt <= wb_cnt - 1'b1;
+                default: ;
+            endcase
         end
     end
 
@@ -489,10 +581,12 @@ module cache #(
                         f_poison <= snoop_flush;
                         is_pf    <= 1'b0;
                         state    <= S_FILL;
-                    end else if (wr_now) begin
-                        w_hit <= hit_any;
-                        w_sa  <= r_sa;
-                        w_way <= hit_way;
+                    end else if (!wb_empty && (wb_hazard || !c_rd || !lu_ok)) begin
+                        // Drain when the memory port would otherwise be idle,
+                        // or when a queued write is standing in the way of a
+                        // fill. A pending read with no hazard is served first:
+                        // the CPU is waiting on it, and nothing is waiting on
+                        // the queue.
                         state <= S_WRITE;
                     end else if (pf_start) begin
                         // Demand work always wins: this arm is only reached
@@ -533,6 +627,8 @@ module cache #(
                 end
 
                 S_WRITE: begin
+                    // One entry per visit, then back to S_IDLE so a waiting
+                    // CPU access is looked at again before the next drain.
                     if (m_ready) state <= S_IDLE;
                 end
 
@@ -560,7 +656,10 @@ module cache #(
     // On the fill path the word is on m_rdata in the very cycle c_ready
     // pulses, so it has to be forwarded rather than waited for.
     assign c_rdata = fill_ack ? m_rdata : hold;
-    assign c_ready = hit_ack || fill_ack || write_ack;
+    // A queued store is acknowledged immediately; write_ack no longer has
+    // anything to do with the CPU, since the drain it belongs to happens long
+    // after the store retired.
+    assign c_ready = hit_ack || fill_ack || wb_push;
 
     // ---- statistics ----
     logic acc_d;

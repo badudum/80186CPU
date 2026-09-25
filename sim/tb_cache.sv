@@ -131,15 +131,46 @@ module tb_cache;
         end
     endtask
 
+    // Back-to-back writes with no idle cycle between them, which t_write
+    // cannot do: it drops c_wr and waits two edges, and the queue drains in
+    // that gap. Without this the queue never holds more than one entry and
+    // the read-after-write hazard cannot be reproduced at all.
+    task automatic t_write_burst(input int a0, input int stride, input int n);
+        begin
+            @(negedge clk);
+            for (int k = 0; k < n; k++) begin
+                c_addr  = (a0 + k * stride);
+                c_wdata = 16'hD00D + k[15:0] * 16'h0110;
+                c_be    = 2'b11;
+                c_wr    = 1'b1;
+                forever begin
+                    @(posedge clk);
+                    if (c_ready) break;
+                    @(negedge clk);
+                end
+                @(negedge clk);
+            end
+            c_wr = 1'b0;
+        end
+    endtask
+
+    // Reports how many cycles the CPU was held, which is the whole point of
+    // posting writes: the store is acknowledged when it is QUEUED, so this is
+    // no longer the SDRAM's write latency.
+    int last_write_cycles;
     task automatic t_write(input int a, input logic [15:0] d, input logic [1:0] be);
+        int n;
         begin
             @(negedge clk);  c_addr = a[19:0]; c_wdata = d; c_be = be;
             @(negedge clk);  c_wr = 1'b1;
+            n = 0;
             forever begin
                 @(posedge clk);
+                n++;
                 if (c_ready) break;
                 @(negedge clk);
             end
+            last_write_cycles = n;
             @(negedge clk);  c_wr = 1'b0; c_be = 2'b11;
             @(negedge clk);
         end
@@ -250,8 +281,19 @@ module tb_cache;
         chk("...and the line really was cached, not refetched twice", c2, 3);
 
         // ---- writes ----
+        // POSTED. The store is acknowledged when it enters the write queue,
+        // not when SDRAM takes it, so the memory is checked after letting the
+        // queue drain. What must still be true is that it gets there, exactly
+        // once, with the right bytes and in order.
         mem_writes = 0;
         t_write('h00100, 16'hBEEF, 2'b11);
+        checks++;
+        if (last_write_cycles > 3) begin
+            $display("FAIL a posted write held the CPU for %0d cycles",
+                     last_write_cycles);
+            errors++;
+        end
+        settle();
         chk("a write reached memory", mem_writes, 1);
         chkh("memory took the low byte",  mem['h00100], 8'hEF);
         chkh("memory took the high byte", mem['h00101], 8'hBE);
@@ -262,12 +304,14 @@ module tb_cache;
 
         // a single byte, into a line that is resident
         t_write('h00102, 16'h00A5, 2'b01);
+        settle();
         t_read('h00102, d, c2);
         chkh("a byte write updated only the low byte", d, 16'h10A5);
         chk("...and still hits", c2, 3);
 
         // a write that misses must not pull the line in
         t_write('h04000, 16'hCAFE, 2'b11);
+        settle();
         chkh("a missing write still reached memory", mem['h04000], 8'hFE);
         t_read('h04000, d, c2);
         chkh("...returns the written word", d, 16'hCAFE);
@@ -276,6 +320,65 @@ module tb_cache;
             $display("FAIL a write allocated a line it should not have");
             errors++;
         end
+
+        // ---- read-after-write against the write queue ----
+        // THE ONE WAY POSTED WRITES CAN CORRUPT. A write that MISSED does not
+        // allocate, so the only copy of the new word is in the queue. Read
+        // that address before the queue drains and, without a hazard check,
+        // the fill takes the line from SDRAM and returns the word as it was
+        // BEFORE the write -- and then caches it, so the wrong value persists.
+        //
+        // No settle() here on purpose: the whole point is to read while the
+        // write is still queued.
+        // The queue has to be FULL for this to bite. One queued write drains
+        // in the few cycles between the store and the read, so the fill never
+        // races it and the test proves nothing -- it passed with the hazard
+        // check deleted. Four writes to four different lines cannot drain in
+        // that window, so the read really does arrive with its word still in
+        // the queue.
+        flush('h000000);
+        settle();
+        t_write_burst('h0C000, 'h100, 4);   // D00D D11D D22D D33D
+        // Read the MOST RECENT write, not the first. The earlier ones have
+        // already drained by now -- a probe showed the queue holding exactly
+        // one entry here -- so reading those races nothing and the check
+        // passes with the hazard logic deleted.
+        $display("  [probe] write queue holds %0d entries when the read is issued",
+                 dut.wb_cnt);
+        checks++;
+        if (dut.wb_cnt < 2) begin
+            $display("FAIL the write queue drained to %0d; this proves nothing",
+                     dut.wb_cnt);
+            errors++;
+        end
+        t_read('h0C300, d, c2);
+        chkh("a read sees a queued write that missed", d, 16'hD33D);
+        settle();
+        t_read('h0C000, d, c2);
+        chkh("...and the earlier ones reached memory too", d, 16'hD00D);
+
+        // The same for a line that is resident: the write hit, so the cached
+        // copy was updated when it was queued and the read must see it
+        // immediately rather than the value SDRAM still holds.
+        t_fill('h0C800);
+        t_write('h0C800, 16'hF00D, 2'b11);
+        t_read('h0C800, d, c2);
+        chkh("a read sees a queued write that hit", d, 16'hF00D);
+
+        // Several queued writes must reach memory in the order they were
+        // issued, including to the same address -- the last one issued has to
+        // be the one that survives.
+        flush('h000000);
+        settle();
+        mem_writes = 0;
+        t_write('h0CA00, 16'h1111, 2'b11);
+        t_write('h0CA02, 16'h2222, 2'b11);
+        t_write('h0CA00, 16'h3333, 2'b11);
+        settle();
+        chk("every queued write reached memory", mem_writes, 3);
+        chkh("...the later write to an address won, low",  mem['h0CA00], 8'h33);
+        chkh("...the later write to an address won, high", mem['h0CA01], 8'h33);
+        chkh("...and the other address is untouched",      mem['h0CA02], 8'h22);
 
         // ---- set associativity ----
         // Direct mapped, two addresses sharing an index evicted each other on
