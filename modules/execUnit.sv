@@ -102,6 +102,8 @@
     rep_en         <= dl_rep;                         \
     rep_z          <= dl_rep_z;                       \
     instr_start_ip <= ip_next;                        \
+    spec_taken     <= bp_taken;                       \
+    spec_target    <= bp_target;                      \
     cap_len_dbg    <= dl_len;                         \
     cap_valid_dbg  <= 1'b1;                           \
     ip_next        <= ip_next + {13'd0, dl_len};      \
@@ -401,6 +403,46 @@ module execUnit
         .imm2         (dl_imm2)
     );
 
+    // ---- branch prediction ----
+    // Looked up with ip_next in the cycle an instruction is captured, which
+    // is the address that capture is about to record as instr_start_ip. The
+    // answer is needed in that same cycle because that is the cycle the fetch
+    // can still be redirected in.
+    //
+    // A prediction is acted on ONLY when the whole instruction was taken from
+    // the queue in one go (fast_take). The redirect flushes the queue, and
+    // flushing is only safe once every byte of the instruction is already in
+    // hand -- the same argument that makes the unconditional early redirect
+    // safe at S_PREP.
+    logic        bp_valid, bp_taken;
+    logic [15:0] bp_target;
+    logic        bp_u_valid;
+
+    // Only conditional branches are learned. The unconditional forms already
+    // get an exact early redirect at S_PREP, and an entry for one would only
+    // evict a branch that actually needs guessing.
+    logic bp_is_cond;
+    assign bp_is_cond = (iclass == C_JCC) || (iclass == C_LOOP);
+    assign bp_u_valid = (state == S_RETIRE) && bp_is_cond;
+
+    bpred u_bpred (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .q_ip     (ip_next),
+        .p_valid  (bp_valid),
+        .p_taken  (bp_taken),
+        .p_target (bp_target),
+        .u_valid  (bp_u_valid),
+        .u_ip     (instr_start_ip),
+        .u_taken  (do_jump),
+        .u_target (jump_target)
+    );
+
+    // What the current instruction was predicted to do, carried from its
+    // capture to its retire.
+    logic        spec_taken;
+    logic [15:0] spec_target;
+
     // ---- taking a whole instruction in one cycle ----
     // The four states that read an instruction in -- opcode, ModR/M,
     // displacement, immediate -- cost 20.4% of all cycles between them, and
@@ -445,8 +487,26 @@ module execUnit
     logic fast_here, fast_take;
     assign fast_here = dl_valid && !prefix_seen && !block_int_once
                        && !hw_int_ready;
+    // NOT when a prediction is outstanding: the queue then holds bytes from
+    // the predicted target, not from ip_next, so capturing from it would
+    // decode the wrong address as the next instruction. That is a
+    // CORRECTNESS hazard rather than a performance one, and it is the only
+    // place speculation can become one.
     assign fast_take = fast_here && ((state == S_FETCH_OP)
-                                     || (state == S_RETIRE && !do_jump));
+                                     || (state == S_RETIRE && !do_jump
+                                         && !spec_taken));
+
+    // The speculative redirect actually issued this cycle.
+    logic spec_go;
+    assign spec_go = fast_take && bp_taken;
+
+    // A prediction was right when the branch really was taken, to the address
+    // the fetch was already redirected to. Restricted to the classes that
+    // allocate entries: anything else reaching here with spec_taken set is an
+    // index collision, and the ordinary redirect path handles it.
+    logic spec_ok;
+    assign spec_ok = spec_taken && do_jump && bp_is_cond
+                     && (spec_target == jump_target);
 
 
     // The byte-at-a-time path still drives a single-byte pop; the fast path
@@ -1197,6 +1257,14 @@ module execUnit
 
             default: ;
         endcase
+
+        // The speculative redirect. Issued from whichever state captured the
+        // instruction, in the same cycle as the capture. fetch_set flushes
+        // the queue, which is why this is gated on fast_take.
+        if (spec_go) begin
+            fetch_set  = 1'b1;
+            fetch_addr = ({4'h0, cs} << 4) + {4'h0, bp_target};
+        end
     end
 
     // =====================================================================
@@ -1241,6 +1309,8 @@ module execUnit
             block_int_once <= 1'b0;
             prefix_seen  <= 1'b0;
             early_fetch  <= 1'b0;
+            spec_taken   <= 1'b0;
+            spec_target  <= 16'h0000;
             seg_ovr_en   <= 1'b0;
             seg_ovr      <= SR_DS;
             rep_en       <= 1'b0;
@@ -1303,6 +1373,16 @@ module execUnit
                     flags_mask_r <= FM_NONE;
                     seg_r        <= SR_DS;
                     int_taken_r  <= 1'b0;
+                    // A SLOW-PATH START CARRIES NO PREDICTION. START_INSTR is
+                    // the only other writer of spec_taken, and a prefixed
+                    // instruction never runs it -- fast_here requires
+                    // !prefix_seen. Without this clear such an instruction
+                    // inherits the PREVIOUS instruction's prediction and can
+                    // reach S_RETIRE with spec_ok true, skipping a redirect
+                    // that was never issued and running the fall-through bytes
+                    // as if they were the branch target. START_INSTR below
+                    // overwrites this when there is a real prediction.
+                    spec_taken   <= 1'b0;
 
                     // An instruction boundary is the only place a hardware
                     // interrupt may be accepted. Checked before the opcode is
@@ -2082,10 +2162,30 @@ module execUnit
                 S_WB_HI: state <= S_RETIRE;
 
                 S_RETIRE: begin
-                    if (fast_take) begin
+                    if (spec_ok) begin
+                        // Predicted right: the queue is already filling from
+                        // the target, so there is nothing to flush and no
+                        // S_REDIRECT to pass through. This is the entire win.
+                        spec_taken  <= 1'b0;
+                        early_fetch <= 1'b0;
+                        ip_next     <= jump_target;
+                        state       <= S_FETCH_OP;
+                    end else if (spec_taken && !do_jump) begin
+                        // Predicted taken, resolved not taken. The queue holds
+                        // the wrong path, so recover down the same road every
+                        // taken branch takes today -- a mispredict costs what
+                        // a taken branch already costs, and no more.
+                        spec_taken  <= 1'b0;
+                        jump_target <= ip_next;
+                        state       <= S_REDIRECT;
+                    end else if (fast_take) begin
                         `START_INSTR
                     end else begin
-                        state <= do_jump ? S_REDIRECT : S_FETCH_OP;
+                        // Includes the wrong-target case: spec_taken with a
+                        // real jump somewhere else. S_REDIRECT flushes to
+                        // jump_target, which is correct by construction.
+                        spec_taken <= 1'b0;
+                        state      <= do_jump ? S_REDIRECT : S_FETCH_OP;
                     end
                 end
 

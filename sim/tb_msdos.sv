@@ -179,6 +179,8 @@ module tb_msdos;
     );
 
     localparam logic [5:0] ST_FETCH_OP = 6'd1;
+    int bp_predicted = 0, bp_right = 0, bp_wrong = 0;
+    int bp_cond = 0, bp_cond_taken = 0;
     int  dl_checked = 0, dl_mismatch = 0, dl_unknown = 0;
     int  unk_occ = 0, unk_empty = 0, unk_after_flush = 0;
     int  fetch_starved = 0, fetch_total = 0, starved_after_flush = 0;
@@ -239,7 +241,35 @@ module tb_msdos;
             have_len   = `EXEC.cap_valid_dbg;
             jumped     = 1'b0;
         end
-        if (`EXEC.fetch_set) jumped = 1'b1;
+        // A flush breaks the address chain legitimately -- but the two
+        // flushes speculation introduces do not line up with the boundary the
+        // same way, and taking them at face value reported 219,006 correct
+        // predictions as desynchronisations.
+        //
+        //   spec_go is the SPECULATIVE flush, issued in the cycle a branch is
+        //   captured. instr_start_ip does not move until the end of that
+        //   cycle, so this sample sees the flush one instruction EARLY and
+        //   would skip the check for the branch itself. It is not a boundary
+        //   change on its own: the branch still either falls through or is
+        //   taken, and both of those are covered below.
+        //
+        //   spec_ok is a correct prediction, the one case where IP moves to a
+        //   branch target with NO flush at all, because the queue was already
+        //   redirected. That is a real break in the chain and the only thing
+        //   standing in for the S_REDIRECT that did not happen.
+        if (`EXEC.fetch_set && !`EXEC.spec_go) jumped = 1'b1;
+        if (`EXEC.spec_ok) jumped = 1'b1;
+
+        // ---- was the guess any good? ----
+        if (`EXEC.spec_go)                       bp_predicted++;
+        if (`EXEC.state == ST_RETIRE) begin
+            if (`EXEC.spec_ok)                   bp_right++;
+            else if (`EXEC.spec_taken)           bp_wrong++;
+            if (`EXEC.bp_u_valid) begin
+                bp_cond++;
+                if (`EXEC.do_jump)               bp_cond_taken++;
+            end
+        end
 
         // How often the whole-instruction capture is available, and why not.
         if (`EXEC.state == ST_FETCH_OP && !dut.halted) begin
@@ -690,6 +720,12 @@ module tb_msdos;
                  fast_hits, fetch_entries, blk_prefix, blk_int, blk_invalid);
         $display("  FETCH_OP: %0d cycles, %0d with an empty queue, %0d just after a flush",
                  fetch_total, fetch_starved, starved_after_flush);
+        $display("  branches: %0d conditional resolved, %0d of them taken (%0.1f%%)",
+                 bp_cond, bp_cond_taken,
+                 bp_cond ? 100.0 * bp_cond_taken / bp_cond : 0.0);
+        $display("  predictor: %0d speculative redirects, %0d right, %0d wrong (%0.1f%% accurate)",
+                 bp_predicted, bp_right, bp_wrong,
+                 (bp_right + bp_wrong) ? 100.0 * bp_right / (bp_right + bp_wrong) : 0.0);
         dump_states();
         $display("");
         show_regs();

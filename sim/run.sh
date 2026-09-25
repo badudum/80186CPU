@@ -83,6 +83,7 @@ case "$TB" in
     tb_storage)        RTL=("$PKG" "$REPO/modules/storage.sv") ;;
     tb_pit)            RTL=("$PKG" "$REPO/modules/pit8253.sv") ;;
     tb_cache)          RTL=("$PKG" "$REPO/modules/cache.sv") ;;
+    tb_bpred)          RTL=("$PKG" "$REPO/modules/bpred.sv") ;;
     tb_decode_len)     RTL=("$PKG" "$REPO/modules/decode.sv"
                             "$REPO/modules/decode_len.sv") ;;
     tb_blitter)        RTL=("$PKG" "$REPO/modules/blitter.sv" "$REPO/modules/framebuffer.sv") ;;
@@ -94,6 +95,7 @@ case "$TB" in
                             "$REPO/modules/decode.sv"
                             "$REPO/modules/microcode.sv"
                             "$REPO/modules/decode_len.sv"
+                            "$REPO/modules/bpred.sv"
                             "$REPO/modules/execUnit.sv"
                             "$REPO/modules/eu.sv"
                             "$REPO/modules/prefetch_queue.sv"
@@ -143,6 +145,7 @@ case "$TB" in
                             "$REPO/modules/decode.sv"
                             "$REPO/modules/microcode.sv"
                             "$REPO/modules/decode_len.sv"
+                            "$REPO/modules/bpred.sv"
                             "$REPO/modules/execUnit.sv"
                             "$REPO/modules/eu.sv"
                             "$REPO/modules/prefetch_queue.sv"
