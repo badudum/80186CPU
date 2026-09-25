@@ -208,13 +208,26 @@ module decode_len
     // the function result directly: `at(i)[7]` is legal SystemVerilog and
     // ModelSim accepts it, but Quartus rejects a bit-select applied to a
     // function call. Naming them is clearer anyway.
+    // always_comb, NOT continuous assigns. `at()` reads the `peek` array,
+    // which is not one of its arguments, so `assign b = at(i)` is sensitive
+    // only to `i` -- when new bytes arrive and the offset happens to be
+    // unchanged, the byte goes stale and the instruction decodes with the
+    // wrong displacement or immediate. always_comb infers sensitivity from
+    // everything read, the array included.
+    //
+    // This is a SIMULATION-ONLY failure: synthesis builds the combinational
+    // logic regardless of sensitivity lists, so the board booted perfectly
+    // while tb_top and tb_bios both failed. That divergence is what made it
+    // look like a cache bug for several rounds.
     logic [7:0] disp_b0, disp_b1, imm_b0, imm_b1, imm_b2, imm_b3;
-    assign disp_b0 = at(disp_at);
-    assign disp_b1 = at(disp_at + 4'd1);
-    assign imm_b0  = at(imm_at);
-    assign imm_b1  = at(imm_at + 4'd1);
-    assign imm_b2  = at(imm_at + 4'd2);
-    assign imm_b3  = at(imm_at + 4'd3);
+    always_comb begin
+        disp_b0 = at(disp_at);
+        disp_b1 = at(disp_at + 4'd1);
+        imm_b0  = at(imm_at);
+        imm_b1  = at(imm_at + 4'd1);
+        imm_b2  = at(imm_at + 4'd2);
+        imm_b3  = at(imm_at + 4'd3);
+    end
 
     always_comb begin
         // A one-byte displacement is SIGNED; a two-byte one is taken whole.
