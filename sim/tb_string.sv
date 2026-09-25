@@ -66,6 +66,23 @@ module tb_string;
     `define SI dut.u_eu.u_regfile.gpr[6]
     `define DI dut.u_eu.u_regfile.gpr[7]
 
+    // How many times the long REP writes into its destination. A copy is
+    // IDEMPOTENT, so a REP that restarts from the beginning after an interrupt
+    // leaves exactly the same bytes behind as one that resumes -- the final
+    // state cannot tell them apart, and a restart is not a cosmetic
+    // difference: with a periodic interrupt a long enough copy would never
+    // finish. Counting the writes can tell them apart.
+    // Counted on the EDGE of wr, not per cycle: the BIU drives wr through both
+    // T2 and T3, so a per-cycle count reads exactly double and looks like the
+    // copy ran twice.
+    int  long_writes = 0;
+    logic prev_wr_l = 1'b0;
+    always @(posedge clk) begin
+        if (wr && !prev_wr_l && !io_cycle && addr >= 'h7000 && addr < 'h7040)
+            long_writes++;
+        prev_wr_l <= wr;
+    end
+
     int i, p;
     task put(input int a, input byte b); begin mem[a] = b; end endtask
     task vec(input int typ, input int off, input int seg);
@@ -164,8 +181,19 @@ module tb_string;
         rst_n = 1;
 
         // Interrupt the long REP once it is under way.
+        //
+        // WATCHES THE ENGINE'S OWN DI, NOT THE ARCHITECTURAL ONE. The string
+        // engine keeps SI/DI/CX in its own registers while it loops and
+        // commits them to the register file on the way out, so the
+        // architectural DI does not move mid-instruction and a trigger
+        // watching it would never fire. It would not fail, either -- it would
+        // wait out the loop and then interrupt nothing, and every check below
+        // about the interrupted copy would pass while testing an
+        // uninterrupted one. The engine's live value is what "under way"
+        // actually means.
         i = 0;
-        while (!((`DI >= 16'h7004) && (`DI < 16'h7030)) && (i < 300000)) begin
+        while (!((dut.u_eu.u_exec.di_r >= 16'h7004) &&
+                 (dut.u_eu.u_exec.di_r <  16'h7030)) && (i < 300000)) begin
             @(negedge clk); i++;
         end
         intr_type = 8'h40;
@@ -228,6 +256,10 @@ module tb_string;
         chk("CX drained", `CX, 16'h0000);
         chk("SI advanced by the full count", `SI, 16'h1040);
         chk("DI advanced by the full count", `DI, 16'h7040);
+        // 64 bytes, written once each. More than that means the interrupt
+        // made the instruction start over rather than carry on, which the
+        // copied bytes themselves cannot show.
+        chk("interrupted REP resumed, did not restart", long_writes, 64);
 
         chk("SP balanced", `SP, 16'h8000);
 

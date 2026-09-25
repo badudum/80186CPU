@@ -342,6 +342,12 @@ module execUnit
     logic [15:0] si_r, di_r, cx_r, ax_r;
     logic [15:0] str_src, str_dst;
     logic [1:0]  str_wb_step;
+    // Whether si_r/di_r/cx_r/ax_r have run ahead of the architectural
+    // registers. Nothing has changed yet on the first trip round the loop, so
+    // an operation that does no iterations at all (REP with CX=0) still leaves
+    // through the short path instead of paying for a writeback of values it
+    // never touched.
+    logic        str_dirty;
 
     // ---- interrupt state ----
     logic [7:0]  int_type_r;
@@ -799,6 +805,20 @@ module execUnit
         alu_flag_bits[F_OF] = alu_of;
     end
 
+    // ---- does the loop go round again? ----
+    // This used to be decided in S_STR_WB, reading cx_r and flags_val_r after
+    // S_STR_EXEC had written them. With the writeback gone from the loop the
+    // decision moves into S_STR_EXEC itself, which is the cycle those values
+    // are being computed in -- so it has to look at what they are ABOUT to
+    // become rather than what they are.
+    logic [15:0] str_cx_next;
+    logic        str_zf_next, str_again;
+    assign str_cx_next = rep_en ? (cx_r - 16'd1) : cx_r;
+    assign str_zf_next = str_cmp ? alu_flag_bits[F_ZF] : flags_val_r[F_ZF];
+    assign str_again   = rep_en && (str_cx_next != 16'h0000)
+                         && (!str_cmp || (str_zf_next == rep_z));
+
+
     // =====================================================================
     // Combinational outputs
     // =====================================================================
@@ -1171,10 +1191,21 @@ module execUnit
                 end
             end
 
-            // SI, DI, CX and AX are all written back every iteration. Writing
-            // an unchanged value costs a cycle and nothing else, and it means
-            // the architectural registers are always correct at the top of the
-            // loop -- which is what makes the operation safely interruptible.
+            // SI, DI, CX and AX are written back ONCE, on the way out of the
+            // loop, rather than once per iteration.
+            //
+            // The property being preserved is that the architectural registers
+            // are correct wherever the instruction can be left -- which is not
+            // every iteration, it is every EXIT. A repeated string operation
+            // can only be abandoned at S_STR_CHECK, where an interrupt is
+            // accepted, and that path comes through here too. In between, the
+            // live values are in si_r/di_r/cx_r/ax_r and nothing else can
+            // observe them: no other instruction is in flight, and the
+            // registers are re-read from the file only at S_STR_PREP1.
+            //
+            // Four cycles an iteration is 20% of a REP MOVSW iteration at zero
+            // wait states, and the string states are 28.7% of every cycle the
+            // MS-DOS boot runs.
             S_STR_WB: begin
                 rf_wr_en   = 1'b1;
                 rf_wr_word = 1'b1;
@@ -1332,6 +1363,7 @@ module execUnit
             str_src      <= 16'h0000;
             str_dst      <= 16'h0000;
             str_wb_step  <= 2'd0;
+            str_dirty    <= 1'b0;
             port_r       <= 16'h0000;
             int_type_r   <= 8'h00;
             int_step     <= 2'd0;
@@ -2316,21 +2348,30 @@ module execUnit
                     cx_r        <= rd0_data;
                     ax_r        <= rd1_data;
                     str_wb_step <= 2'd0;
+                    str_dirty   <= 1'b0;
                     state       <= S_STR_CHECK;
                 end
 
                 S_STR_CHECK: begin
                     if (rep_en && (cx_r == 16'h0000)) begin
                         // REP with CX already zero does nothing at all.
-                        state <= S_RETIRE;
+                        str_wb_step <= 2'd0;
+                        state       <= str_dirty ? S_STR_WB : S_RETIRE;
                     end else if (rep_en && hw_int_ready) begin
                         // Interruptible between iterations -- this is the only
                         // place an interrupt may be taken inside an
                         // instruction. The pushed address is that of the FIRST
                         // prefix, so the whole thing resumes correctly.
+                        //
+                        // AND IT IS WHY THE WRITEBACK CANNOT SIMPLY BE
+                        // DROPPED: the handler sees SI, DI and CX, and the
+                        // resumed instruction re-reads them, so they have to
+                        // be committed before leaving. The loop skips the
+                        // writeback; the exits do not.
                         do_jump     <= 1'b1;
                         jump_target <= instr_start_ip;
-                        state       <= S_RETIRE;
+                        str_wb_step <= 2'd0;
+                        state       <= str_dirty ? S_STR_WB : S_RETIRE;
                     end else if (str_rd_src || str_io_rd) begin
                         state <= S_STR_RD1;
                     end else if (str_rd_dst) begin
@@ -2375,25 +2416,21 @@ module execUnit
                     if (str_adj_di) di_r <= di_r + str_delta;
                     if (rep_en)     cx_r <= cx_r - 16'd1;
 
+                    // Go round again without touching the register file. A
+                    // plain string op runs once; REP repeats while CX is
+                    // non-zero, and the compare forms additionally stop as
+                    // soon as the zero flag stops matching the prefix (F3
+                    // repeats while equal, F2 while not equal).
+                    str_dirty   <= 1'b1;
                     str_wb_step <= 2'd0;
-                    state       <= S_STR_WB;
+                    state       <= str_again ? S_STR_CHECK : S_STR_WB;
                 end
 
                 S_STR_WB: begin
-                    if (str_wb_step == 2'd3) begin
-                        // Decide whether to go round again. A plain string op
-                        // runs once. REP repeats while CX is non-zero; for the
-                        // compare forms it additionally stops as soon as the
-                        // zero flag stops matching the prefix (F3 repeats while
-                        // equal, F2 while not equal).
-                        if (rep_en && (cx_r != 16'h0000) &&
-                            (!str_cmp || (flags_val_r[F_ZF] == rep_z)))
-                            state <= S_STR_CHECK;
-                        else
-                            state <= S_RETIRE;
-                    end else begin
-                        str_wb_step <= str_wb_step + 2'd1;
-                    end
+                    // Reached only on the way out, so there is no longer a
+                    // loop decision here.
+                    if (str_wb_step == 2'd3) state <= S_RETIRE;
+                    else str_wb_step <= str_wb_step + 2'd1;
                 end
 
                 // PUSHA pushes AX CX DX BX SP BP SI DI in that order, where

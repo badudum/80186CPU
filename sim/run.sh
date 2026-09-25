@@ -139,7 +139,7 @@ case "$TB" in
                             "$REPO/modules/memory_controller.sv"
                             "$REPO/modules/chip_select.sv") ;;
     tb_biu)            RTL=("$PKG" "$REPO/modules/biu.sv" "$REPO/modules/prefetch_queue.sv") ;;
-    tb_cpu|tb_interrupt|tb_pic|tb_timer|tb_far|tb_string|tb_misc|tb_dma|tb_halt|tb_bpred_int) RTL=("$PKG"
+    tb_cpu|tb_interrupt|tb_pic|tb_timer|tb_far|tb_string|tb_misc|tb_dma|tb_halt|tb_bpred_int|tb_strperf) RTL=("$PKG"
                             "$REPO/modules/ALU.sv"
                             "$REPO/modules/regfile.sv"
                             "$REPO/modules/decode.sv"
