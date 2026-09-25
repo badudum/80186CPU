@@ -510,6 +510,13 @@ class Asm:
     def movsw(self): self.db(0xA5)
     def stosb(self): self.db(0xAA)
     def stosw(self): self.db(0xAB)
+    # INS/OUTS: 80186 additions. They move a word between an I/O port in DX
+    # and ES:DI (in) or DS:SI (out), advancing the pointer, so with a REP
+    # prefix one instruction does what IN/STOSW/LOOP did per word.
+    def insb(self):  self.db(0x6C)
+    def insw(self):  self.db(0x6D)
+    def outsb(self): self.db(0x6E)
+    def outsw(self): self.db(0x6F)
     def lodsb(self): self.db(0xAC)
     def lodsw(self): self.db(0xAD)
     def scasb(self): self.db(0xAE)

@@ -104,6 +104,7 @@ P_T2_CTL = P_PCB + 0x66
 # why. `--clk-hz` exists so the rate lives in one place; FPGA80186.sv's CLK_HZ
 # is the same number on the hardware side and the two must agree.
 CLK_HZ = 25_000_000
+_CLK_GIVEN = False
 _argv = []
 _skip = False
 for _i, _a in enumerate(sys.argv):
@@ -112,9 +113,11 @@ for _i, _a in enumerate(sys.argv):
         continue
     if _a == "--clk-hz":
         CLK_HZ = int(sys.argv[_i + 1])
+        _CLK_GIVEN = True
         _skip = True                 # the value is not the output directory
     elif _a.startswith("--clk-hz="):
         CLK_HZ = int(_a.split("=", 1)[1])
+        _CLK_GIVEN = True
     else:
         _argv.append(_a)
 sys.argv = _argv
@@ -143,6 +146,30 @@ if CLK_HZ != 25_000_000:
 # can actually reach. It must never go into a bitstream, which is why it is a
 # flag rather than the default.
 FAST_TICK = "--fast-tick" in sys.argv
+
+# A --fast-tick ROM MUST say which clock it is for.
+#
+# The clock guard that protects the synthesised ROM cannot protect this one.
+# FPGA80186.sv compares its CLK_HZ against rom/clk.svh, but gen_bios.py writes
+# clk.svh into its OUTPUT directory -- so building into rom/fast/ writes
+# rom/fast/clk.svh, which nothing reads, and the simulation happily runs a ROM
+# whose timer divisor is for a different clock. That is what happened: rom/fast
+# was rebuilt without --clk-hz, took the 25 MHz default against a 40 MHz
+# machine, and every CPI measured afterwards carried about 1.6x the real
+# interrupt load. Nothing failed; the numbers were just quietly wrong.
+#
+# --fast-tick is only ever used for the simulation ROM, which is exactly the
+# ROM the guard cannot reach, so requiring the clock here closes it.
+if FAST_TICK and not _CLK_GIVEN:
+    sys.stderr.write(
+        "error: --fast-tick requires an explicit --clk-hz.\n"
+        "       This ROM is for simulation, where nothing checks the clock it\n"
+        "       was built for, so it has to be stated rather than defaulted.\n"
+        "       For this project:\n"
+        "         python3 tools/gen_bios.py --clk-hz 40000000 rom/fast"
+        " --fast-tick --geometry 18,2,2880\n")
+    sys.exit(1)
+
 if FAST_TICK:
     T0_DIVISOR = max(1, T0_DIVISOR // 64)
     print("FAST TICK: T0 divisor %d -- simulation only, do NOT synthesise this"
@@ -1383,13 +1410,24 @@ a.jnz("rs_wait")
 a.test(AL, 0x04)                  # ERR
 a.jnz("rs_fail")
 
+# REP INSW, not IN/STOSW/LOOP.
+#
+# This loop moved one word per ITERATION and cost three instructions to do it:
+# the IN, the STOSW that stored it, and the LOOP that closed the loop. Measured
+# on the MS-DOS boot that is 100,864 words a boot -- 100,864 INs, 100,864
+# single-word STOSWs each paying the string engine's full per-instruction
+# setup, and 100,864 LOOPs. Around 300,000 instructions, a quarter of every
+# instruction the machine retires, to move 394 sectors.
+#
+# INSW is an 80186 instruction that reads a word from the port in DX straight
+# to ES:DI and advances DI -- exactly IN plus STOSW -- so with REP the whole
+# sector is one instruction and the per-word fetch, decode and retire
+# disappear. The CPU has implemented it all along; this loop predates it being
+# used.
 a.mov(CX, 256)
 a.mov(DX, P_STOR_DATA)
 a.cld()
-a.label("rs_xfer")
-a.in_dx(AX)
-a.stosw()
-a.loop("rs_xfer")
+a.rep(); a.insw()
 
 a.clc()
 a.jmps("rs_out")
@@ -1432,13 +1470,12 @@ a.out_dx(AX)
 a.mov(AX, ES)
 a.mov(DS, AX)                     # DS:SI = ES:DI for the duration
 a.mov(SI, DI)
+# REP OUTSW, for the same reason as the read path above: OUTSW takes the word
+# from DS:SI and sends it to the port in DX, which is LODSW plus OUT.
 a.mov(CX, 256)
 a.mov(DX, P_STOR_DATA)
 a.cld()
-a.label("ws_xfer")
-a.lodsw()
-a.out_dx(AX)
-a.loop("ws_xfer")
+a.rep(); a.outsw()
 a.mov(DI, SI)                     # leave DI past the sector, as STOSW would
 a.pop(DS)
 

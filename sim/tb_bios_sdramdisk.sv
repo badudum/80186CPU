@@ -93,6 +93,20 @@ module tb_bios_sdramdisk;
     int disk_busy_cycles = 0;
     always @(posedge dut.clk_cpu) if (dut.disk_mrd) disk_busy_cycles++;
 
+    // CYCLES TO REACH THE HLT. This testbench does a FIXED amount of disk
+    // work -- the boot sector, then KERNEL.BIN through INT 13h -- and then
+    // stops, so the cycle count is a work-normalised measure of the whole
+    // read path in a way CPI is not. Changing how many instructions a sector
+    // takes moves CPI's denominator, and a change that deletes a great many
+    // cheap instructions raises CPI while making the machine faster. This
+    // number cannot do that: the work is the same, so lower is faster.
+    int boot_cycles = 0;
+    logic was_halted = 1'b0;
+    always @(posedge dut.clk_cpu) begin
+        if (!dut.halted && !was_halted) boot_cycles++;
+        if (dut.halted) was_halted <= 1'b1;
+    end
+
     function automatic string read_line(input int row, input int len);
         string t = "";
         for (int c = 0; c < len; c++) t = {t, string'(cell_ch(row * 80 + c))};
@@ -153,6 +167,8 @@ module tb_bios_sdramdisk;
         i = 0;
         while (i < 5000000) begin @(negedge CLOCK_50); i++; end
         chk("machine reached the boot sector's HLT", dut.halted, 1'b1);
+        $display("  boot reached HLT in %0d cycles (disk busy %0d)",
+                 boot_cycles, disk_busy_cycles);
 
         $display("");
         // Row r holds what was printed as line r+1. The kernel ends by

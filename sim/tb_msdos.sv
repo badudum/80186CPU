@@ -59,7 +59,8 @@ module tb_msdos;
     defparam dut.u_clk_rst.DEBOUNCE = 20;
     defparam dut.u_mem.SDRAM_INIT_CYCLES = 40;
     // A BIOS whose timer ticks 64x too fast, built by
-    //   python3 tools/gen_bios.py rom/fast --fast-tick --geometry 18,2,2880
+    //   python3 tools/gen_bios.py --clk-hz 40000000 rom/fast --fast-tick \
+    //                             --geometry 18,2,2880
     //
     // THE GEOMETRY IS NOT OPTIONAL AND MUST MATCH THE IMAGE BELOW. This
     // testbench boots ms-dos/disk01.img, a 1.44 MB floppy whose BPB declares
@@ -305,6 +306,60 @@ module tb_msdos;
         else if (flush_age < 999)       flush_age = flush_age + 1;
         dl_prev = `EXEC.state;
     end
+
+    // ---- what is the machine doing in S_IO_RD? ----
+    // It is 6.6% of every cycle, which is a lot for an instruction nobody
+    // writes much of. Cycles alone cannot say whether that is a few very slow
+    // ports or an enormous number of fast ones, and the answer decides whether
+    // the fix belongs in the CPU, in io_decode, or in the BIOS that is doing
+    // the polling. So: count the instructions as well as the cycles, and
+    // record which port each one addressed and who executed it.
+    localparam logic [5:0] ST_IO_RD = 6'd33;
+    localparam logic [5:0] ST_IO_WR = 6'd34;
+
+    int io_rd_instrs = 0, io_wr_instrs = 0;
+    int io_rd_cycles = 0;
+    int port_rd_cnt [0:1023];
+    int port_rd_cyc [0:1023];
+    int io_caller_ip [0:1023];      // last CS:IP seen issuing to that port
+    initial for (int k = 0; k < 1024; k++) begin
+        port_rd_cnt[k] = 0; port_rd_cyc[k] = 0; io_caller_ip[k] = 0;
+    end
+
+    logic [5:0] io_prev = 6'd0;
+    always @(posedge dut.clk_cpu) begin
+        if (!dut.halted) begin
+            if (`EXEC.state == ST_IO_RD) begin
+                io_rd_cycles++;
+                port_rd_cyc[`EXEC.port_r[9:0]]++;
+                if (io_prev != ST_IO_RD) begin
+                    io_rd_instrs++;
+                    port_rd_cnt[`EXEC.port_r[9:0]]++;
+                    io_caller_ip[`EXEC.port_r[9:0]] = int'(ip_now);
+                end
+            end
+            if (`EXEC.state == ST_IO_WR && io_prev != ST_IO_WR) io_wr_instrs++;
+            io_prev <= `EXEC.state;
+        end
+    end
+
+    task dump_io;
+        begin
+            $display("");
+            $display("  I/O reads: %0d instructions in %0d cycles (%0.1f cycles each), %0d writes",
+                     io_rd_instrs, io_rd_cycles,
+                     io_rd_instrs ? real'(io_rd_cycles) / real'(io_rd_instrs) : 0.0,
+                     io_wr_instrs);
+            $display("    %-8s %10s %12s %8s  %s", "port", "reads", "cycles",
+                     "share", "last reader IP");
+            for (int k = 0; k < 1024; k++)
+                if (port_rd_cyc[k] * 200 > io_rd_cycles)   // over 0.5% of IO_RD
+                    $display("    %03h      %10d %12d %7.1f%%  %04h",
+                             k, port_rd_cnt[k], port_rd_cyc[k],
+                             100.0 * port_rd_cyc[k] / io_rd_cycles,
+                             io_caller_ip[k]);
+        end
+    endtask
 
     string st_name [0:63];
     initial begin
@@ -741,6 +796,7 @@ module tb_msdos;
                  bp_predicted, bp_right, bp_wrong,
                  (bp_right + bp_wrong) ? 100.0 * bp_right / (bp_right + bp_wrong) : 0.0);
         dump_states();
+        dump_io();
         $display("");
         show_regs();
         // The loop it is sitting in, for an offline disassembly.
