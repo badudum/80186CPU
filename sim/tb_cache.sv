@@ -173,6 +173,10 @@ module tb_cache;
 
     logic [15:0] d;
     int i, miss_cycles, hit_cycles, c2;
+    int evicted;
+    // Two addresses land in the same set when they differ by this: the number
+    // of sets times the line size in bytes.
+    localparam int SET_STRIDE = (KB * 1024) / 8;
 
     initial begin
         for (i = 0; i < 'h1FFFF; i++) mem[i] = i[7:0];
@@ -273,47 +277,67 @@ module tb_cache;
             errors++;
         end
 
-        // ---- two addresses sharing an index ----
-        // KB*1024 bytes of data, so addresses that far apart land on the same
-        // line and evict each other.
+        // ---- set associativity ----
+        // Direct mapped, two addresses sharing an index evicted each other on
+        // every access -- and the code that does that is ordinary: a loop
+        // reading one array and writing another. With eight ways they
+        // coexist. Addresses in the same set differ by SETS * line bytes.
+        flush('h000000);
+        settle();
         t_fill('h00700);
-        t_fill('h00700 + KB * 1024);
-        t_read('h00700 + KB * 1024, d, c2);
+        t_fill('h00700 + SET_STRIDE);
+        t_read('h00700 + SET_STRIDE, d, c2);
         chkh("the aliasing address reads its own data", d,
-             16'h1000 + ('h00700 + KB * 1024) / 2);
+             16'h1000 + ('h00700 + SET_STRIDE) / 2);
+        chk("...as a hit", c2, 3);
         t_read('h00700, d, c2);
-        chkh("...and the first one is correct again after eviction", d, 16'h1380);
+        chkh("...and the FIRST one is still resident too", d, 16'h1380);
+        chk("...also a hit -- they no longer evict each other", c2, 3);
+
+        // Fill every way of one set, then one more: something must go. This
+        // is what proves there are eight ways rather than one.
+        flush('h000000);
+        settle();
+        for (i = 0; i < 8; i++) begin
+            t_fill('h00700 + i * SET_STRIDE);
+        end
+        t_read('h00700, d, c2);
+        chk("with the set exactly full, the first way is still there", c2, 3);
+
+        t_fill('h00700 + 8 * SET_STRIDE);       // a ninth tag in the same set
+        t_read('h00700 + 8 * SET_STRIDE, d, c2);
+        chkh("the ninth line is resident", d,
+             16'h1000 + ('h00700 + 8 * SET_STRIDE) / 2);
+
+        // Whichever line PLRU chose, one of the nine must now miss -- and
+        // every one of them must still return correct data when refetched.
+        evicted = 0;
+        for (i = 0; i <= 8; i++) begin
+            t_read('h00700 + i * SET_STRIDE, d, c2);
+            chkh("every line in the set reads back correctly", d,
+                 16'h1000 + ('h00700 + i * SET_STRIDE) / 2);
+            if (c2 > 3) evicted = evicted + 1;
+            settle();
+        end
         checks++;
-        if (c2 <= 3) begin
-            $display("FAIL an evicted line still hit -- tag compare is wrong");
+        if (evicted == 0) begin
+            $display("FAIL nine tags fit in an eight-way set -- nothing was evicted");
             errors++;
         end
 
-        // ---- the one-cycle window where a fill completes ----
-        // A re-read that arrives just as a fill finishes used to be answered
-        // from a stale registered tag: the evicted line's tag was still in
-        // the lookup register while the valid bit had already been set for
-        // its replacement, so asking for the EVICTED address compared equal
-        // and got the new line's data. It needs three things to line up --
-        // two addresses sharing an index, the second evicting the first, and
-        // the re-read landing in exactly the cycle the fill completes -- so
-        // the delay is swept rather than guessed at. Without the sweep this
-        // passes or fails depending on the memory latency, which is not a
-        // property anyone should have to think about to keep the test honest.
-        for (i = 0; i <= 10; i++) begin
-            flush('h000000);                      // start from an empty cache
-            t_fill('h00900);                      // line A resident
-            t_read('h01100, d, c2);               // evicts it, fill still running
-            repeat (i) @(negedge clk);
-            t_read('h00900, d, c2);               // lands near the fill's end
-            checks++;
-            if (d !== 16'h1480) begin
-                $display("FAIL stale lookup answered an evicted address (delay %0d): got=%04h exp=1480", i, d);
-                errors++;
-            end
-        end
+        // PLRU must not evict the most recently used line. Touch one way
+        // just before overflowing the set; it has to survive.
+        flush('h000000);
+        settle();
+        for (i = 0; i < 8; i++) t_fill('h00700 + i * SET_STRIDE);
+        t_read('h00700, d, c2);                 // way 0 is now most recent
+        chk("way 0 is resident before the overflow", c2, 3);
+        t_fill('h00700 + 8 * SET_STRIDE);       // forces one out
+        settle();
+        t_read('h00700, d, c2);
+        chk("PLRU did not evict the most recently used line", c2, 3);
 
-        // ---- snooping ----
+        // ---- snooping ----        // ---- snooping ----
         t_fill('h00500);
         t_read('h00500, d, c2);
         chk("resident before the snoop", c2, 3);

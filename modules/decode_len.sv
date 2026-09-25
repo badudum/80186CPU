@@ -204,27 +204,38 @@ module decode_len
         at = (i > 4'd5) ? 8'h00 : peek[i[2:0]];
     endfunction
 
+    // The bytes are pulled out into named signals rather than bit-selecting
+    // the function result directly: `at(i)[7]` is legal SystemVerilog and
+    // ModelSim accepts it, but Quartus rejects a bit-select applied to a
+    // function call. Naming them is clearer anyway.
+    logic [7:0] disp_b0, disp_b1, imm_b0, imm_b1, imm_b2, imm_b3;
+    assign disp_b0 = at(disp_at);
+    assign disp_b1 = at(disp_at + 4'd1);
+    assign imm_b0  = at(imm_at);
+    assign imm_b1  = at(imm_at + 4'd1);
+    assign imm_b2  = at(imm_at + 4'd2);
+    assign imm_b3  = at(imm_at + 4'd3);
+
     always_comb begin
         // A one-byte displacement is SIGNED; a two-byte one is taken whole.
         case (eff_disp)
-            2'd1:    disp = {{8{at(disp_at)[7]}}, at(disp_at)};
-            2'd2:    disp = {at(disp_at + 4'd1), at(disp_at)};
+            2'd1:    disp = {{8{disp_b0[7]}}, disp_b0};
+            2'd2:    disp = {disp_b1, disp_b0};
             default: disp = 16'h0000;
         endcase
 
         // imm_sext is the same distinction for immediates: an 8-bit
         // immediate on a 16-bit operation is sign-extended.
         case (d_imm_bytes)
-            3'd1:    imm = d_sext ? {{8{at(imm_at)[7]}}, at(imm_at)}
-                                  : {8'h00, at(imm_at)};
+            3'd1:    imm = d_sext ? {{8{imm_b0[7]}}, imm_b0}
+                                  : {8'h00, imm_b0};
             3'd2,
-            3'd4:    imm = {at(imm_at + 4'd1), at(imm_at)};
+            3'd4:    imm = {imm_b1, imm_b0};
             default: imm = 16'h0000;
         endcase
 
         // Only the ptr16:16 forms have a second immediate.
-        imm2 = (d_imm_bytes == 3'd4)
-                 ? {at(imm_at + 4'd3), at(imm_at + 4'd2)} : 16'h0000;
+        imm2 = (d_imm_bytes == 3'd4) ? {imm_b3, imm_b2} : 16'h0000;
     end
 
     assign valid = (count >= need_for_len) && (count >= total) && (total <= 4'd6);

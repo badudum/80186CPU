@@ -70,6 +70,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE modules/cpu_top.sv
 set_global_assignment -name SYSTEMVERILOG_FILE modules/biu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE modules/eu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE modules/decode.sv
+set_global_assignment -name SYSTEMVERILOG_FILE modules/decode_len.sv
 set_global_assignment -name SYSTEMVERILOG_FILE modules/execUnit.sv
 set_global_assignment -name SYSTEMVERILOG_FILE modules/ALU.sv
 set_global_assignment -name SYSTEMVERILOG_FILE modules/regfile.sv

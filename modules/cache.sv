@@ -54,14 +54,36 @@
 // invalidates everything. Valid bits are flops precisely so that costs one
 // cycle rather than a sweep.
 //
-// GEOMETRY. KB of data, LINE_WORDS 16-bit words per line, direct mapped.
-// Default 8 KB in 8-byte lines: 1024 lines, a 7-bit tag, about 8 M10K blocks.
+// GEOMETRY. KB of data in LINE_WORDS-word lines, WAYS-way set associative
+// with tree pseudo-LRU replacement. Default 8 KB in 8-byte lines, 8 ways:
+// 128 sets, a 10-bit tag, 7 PLRU bits per set.
+//
+// WHY SET ASSOCIATIVE. Direct mapped is one line per index, so two hot
+// addresses 8 KB apart evict each other on every single access -- and the
+// code that does that is ordinary: a loop reading one array and writing
+// another. Eight ways means eight such addresses can coexist.
+//
+// WHY TREE PLRU RATHER THAN TRUE LRU. True LRU over 8 ways needs an ordering
+// of 8 items per set, which is 3 bits per way plus the logic to reorder them
+// on every hit. Tree PLRU is 7 bits per set and one XOR-free update: each bit
+// is a node in a binary tree saying "the least recently used side is this
+// way". It picks a victim that is never the most recently used and is almost
+// always among the oldest, for a fraction of the state.
+//
+// AN INVALID WAY ALWAYS WINS over the PLRU choice. On a cold cache PLRU would
+// otherwise keep replacing the same way while seven sit empty.
+//
+// READING ALL WAYS AT ONCE is what keeps a hit single-cycle. The way is not
+// known until the tags compare, so the data array is WAYS words wide and the
+// match selects one afterwards. A narrow array indexed by the winning way
+// would need a second cycle for every hit, which costs more than the width.
 // ---------------------------------------------------------------------------
 
 `timescale 1ns/1ns
 module cache #(
     parameter int KB         = 8,
     parameter int LINE_WORDS = 4,
+    parameter int WAYS       = 8,
     // Next-line prefetch. OFF, because it was measured and it LOSES: see the
     // note above the prefetch logic for the numbers and the reason.
     parameter bit PREFETCH   = 1'b0
@@ -103,173 +125,216 @@ module cache #(
 
     localparam int WORDS = (KB * 1024) / 2;
     localparam int LINES = WORDS / LINE_WORDS;
+    localparam int SETS  = LINES / WAYS;
     localparam int OFF_W = $clog2(LINE_WORDS);
-    localparam int IDX_W = $clog2(LINES);
-    localparam int MEM_W = OFF_W + IDX_W;        // word address bits kept
-    localparam int TAG_W = 19 - MEM_W;           // a CPU word address is 19 bits
+    localparam int IDX_W = $clog2(SETS);
+    localparam int WAY_W = $clog2(WAYS);
+    localparam int TAG_W = 19 - OFF_W - IDX_W;   // a CPU word address is 19 bits
+    localparam int SA_W  = IDX_W + OFF_W;        // data array: set and offset
 
     // ---- address break-up ----
     logic [18:0]      c_word;
-    logic [IDX_W-1:0] c_idx;
+    logic [IDX_W-1:0] c_set;
     logic [TAG_W-1:0] c_tag;
-    logic [MEM_W-1:0] c_ma;
+    logic [OFF_W-1:0] c_off;
+    logic [SA_W-1:0]  c_sa;
 
     assign c_word = c_addr[19:1];
-    assign c_ma   = c_word[MEM_W-1:0];
-    assign c_idx  = c_word[MEM_W-1:OFF_W];
-    assign c_tag  = c_word[18:MEM_W];
+    assign c_off  = c_word[OFF_W-1:0];
+    assign c_set  = c_word[SA_W-1:OFF_W];
+    assign c_tag  = c_word[18:SA_W];
+    assign c_sa   = c_word[SA_W-1:0];
 
     // ---- storage ----
-    // Two byte-wide banks so a byte write needs no read-modify-write, the same
-    // shape vram and framebuffer use. Tags are a third block; valid bits are
-    // flops so the whole cache can be dropped in one cycle.
-    logic [7:0]       dat_lo  [0:WORDS-1];
-    logic [7:0]       dat_hi  [0:WORDS-1];
-    logic [TAG_W-1:0] tag_mem [0:LINES-1];
-    logic [LINES-1:0] valid;
+    // Two byte-wide banks so a byte write needs no read-modify-write, each
+    // WAYS bytes wide so every way is read at once. Tags are one wide word
+    // per set for the same reason. Valid bits are flops so the whole cache
+    // can be dropped in a cycle, which is what the snoop needs.
+    // ONE NARROW ARRAY PER WAY, not one wide array indexed by way. The wide
+    // form is the obvious way to write this and it does not synthesise: a
+    // variable part-select write, dat[addr][way*8 +: 8], is not a shape
+    // Quartus recognises as a byte-enabled RAM, so it built the whole 8 KB
+    // out of logic -- 74,235 ALMs against the 32,070 the device has, with
+    // ZERO RAM blocks used. Per-way arrays written from a generate loop give
+    // each way a constant index, which is an ordinary simple dual-port RAM
+    // and infers M10K.
+    logic [7:0]            dat_lo  [0:WAYS-1][0:SETS*LINE_WORDS-1];
+    logic [7:0]            dat_hi  [0:WAYS-1][0:SETS*LINE_WORDS-1];
+    logic [TAG_W-1:0]      tag_mem [0:WAYS-1][0:SETS-1];
+    logic [WAYS-1:0]       valid [0:SETS-1];
+    logic [WAYS-2:0]       plru  [0:SETS-1];
 
     // ---- lookup, launched every cycle ----
-    // This is the one thing that makes a hit cost nothing. The BIU drives the
-    // address in T1 and does not assert rd until T2, so by starting the tag
-    // and data read unconditionally on every edge, the answer is already
-    // waiting when the request arrives and c_ready can come back in T3 -- the
-    // 4-T-state minimum, the fastest an 80186 bus cycle can be. Gating the
-    // lookup on rd instead would add a cycle to every hit.
-    logic [TAG_W-1:0] r_tag_q, r_tag;
-    logic [15:0]      r_data;
-    logic [IDX_W-1:0] r_idx;
-    logic [MEM_W-1:0] r_ma;
+    // The BIU drives the address in T1 and does not assert rd until T2, so
+    // starting the read unconditionally on every edge means the answer is
+    // already waiting when the request arrives and a hit can answer in T3 --
+    // the 4-T-state minimum. Gating on rd would add a cycle to every hit.
+    logic [TAG_W-1:0]      r_tags [0:WAYS-1];
+    logic [7:0]            r_lo [0:WAYS-1];
+    logic [7:0]            r_hi [0:WAYS-1];
+    logic [TAG_W-1:0]      r_tag;
+    logic [IDX_W-1:0]      r_set;
+    logic [OFF_W-1:0]      r_off;
+    logic [SA_W-1:0]       r_sa;
 
     always_ff @(posedge clk) begin
-        r_tag_q <= tag_mem[c_idx];
-        r_data  <= {dat_hi[c_ma], dat_lo[c_ma]};
-        r_tag   <= c_tag;
-        r_idx   <= c_idx;
-        r_ma    <= c_ma;
+        r_tag  <= c_tag;
+        r_set  <= c_set;
+        r_off  <= c_off;
+        r_sa   <= c_sa;
     end
 
     // valid is read COMBINATIONALLY, not registered alongside the rest. A
     // registered copy would be a cycle stale, and a snoop that invalidated a
-    // line in that cycle would be ignored -- a hit on data that had just been
-    // declared wrong. Reading the flops directly closes that window.
-    logic hit;
-    assign hit = valid[r_idx] && (r_tag_q == r_tag);
+    // line in that cycle would be ignored -- a hit on data just declared
+    // wrong. Reading the flops directly closes that window.
+    logic [WAYS-1:0] way_hit;
+    logic            hit_any;
+    logic [WAY_W-1:0] hit_way;
 
-    // THE LOOKUP IS NOT ALWAYS TRUSTWORTHY, and this was a bug the testbench
-    // caught rather than a precaution. The arrays are read-before-write, so
-    // in the cycle immediately after a fill finishes, r_tag_q still holds the
-    // tag of the line that was just EVICTED, while the valid bit has already
-    // been set for its replacement. If the evicted tag is the one being asked
-    // for -- exactly what happens when code alternates between two addresses
-    // that share an index -- the comparison succeeds and the cache returns
-    // the new line's data under the old line's address. The data array has
-    // the same hazard for the last word of a fill.
+    always_comb begin
+        for (int w = 0; w < WAYS; w++)
+            way_hit[w] = valid[r_set][w] && (r_tags[w] == r_tag);
+    end
+    assign hit_any = |way_hit;
+
+    // WAY_HIT IS ONE-HOT BY CONSTRUCTION. A line is only installed on a miss,
+    // and a miss means no valid way already holds that tag, so a tag cannot
+    // appear twice in a set. That is what makes the selects below legal.
     //
-    // The fix is to WAIT one cycle, not to force a miss. Forcing a miss looks
-    // equivalent and is not: it would start a redundant fill of the line that
-    // had just been filled, and, worse, a write arriving in that cycle would
-    // record w_hit = 0 and skip updating a line that really is resident --
-    // leaving a stale word in the cache that write-through is supposed to
-    // make impossible. Gating the DECISION rather than the comparison costs
-    // one cycle in a rare case and keeps `hit` meaning what it says.
+    // SELECT THE DATA ONE-HOT rather than encoding the way and then muxing
+    // with it. Encode-then-mux puts a priority encoder in series with an 8:1
+    // mux on the path that decides c_ready -- two extra levels of logic for
+    // no benefit. Masking each way's bytes with its own hit bit and OR-ing
+    // them is one AND and a balanced OR tree, and it is the same shape the
+    // comparators already produce.
+    logic [15:0] hit_data;
+    always_comb begin
+        hit_data = 16'h0000;
+        for (int w = 0; w < WAYS; w++)
+            hit_data = hit_data | ({16{way_hit[w]}} & {r_hi[w], r_lo[w]});
+    end
+
+    // The encoded way is still needed, but only for the write-hit path and
+    // the PLRU update -- both of which are registered a cycle later and are
+    // nowhere near the critical path. OR-ing rather than prioritising,
+    // again because the input is one-hot.
+    always_comb begin
+        hit_way = '0;
+        for (int w = 0; w < WAYS; w++)
+            hit_way = hit_way | ({WAY_W{way_hit[w]}} & w[WAY_W-1:0]);
+    end
+
+    // THE LOOKUP IS NOT ALWAYS TRUSTWORTHY. The arrays are read-before-write,
+    // so in the cycle after a fill finishes the registered tags still hold
+    // the line that was just evicted while its valid bit has been set for the
+    // replacement. Waiting one cycle is the fix; forcing a miss instead would
+    // start a redundant fill and, worse, make a write record w_hit = 0 for a
+    // line that really is resident, leaving a stale word that write-through
+    // is supposed to make impossible.
     logic arr_wr_d, lu_ok;
     assign lu_ok = !arr_wr_d;
+
+    // ---- victim selection ----
+    // An invalid way first; otherwise walk the PLRU tree from the root. Each
+    // bit points at the side to replace, so following them lands on a way
+    // that is never the most recently used.
+    logic [WAY_W-1:0] plru_way, victim;
+    logic             have_invalid;
+    logic [WAY_W-1:0] invalid_way;
+    logic [WAYS-2:0]  p;
+
+    assign p = plru[r_set];
+
+    always_comb begin
+        have_invalid = 1'b0;
+        invalid_way  = '0;
+        for (int w = WAYS-1; w >= 0; w--)
+            if (!valid[r_set][w]) begin
+                have_invalid = 1'b1;
+                invalid_way  = w[WAY_W-1:0];
+            end
+
+        // Tree walk for 8 ways: node 0 is the root, 1 and 2 the halves,
+        // 3..6 the leaf pairs.
+        plru_way[2] = p[0];
+        plru_way[1] = p[0] ? p[2] : p[1];
+        case ({p[0], plru_way[1]})
+            2'b00:   plru_way[0] = p[3];
+            2'b01:   plru_way[0] = p[4];
+            2'b10:   plru_way[0] = p[5];
+            default: plru_way[0] = p[6];
+        endcase
+
+        victim = have_invalid ? invalid_way : plru_way;
+    end
+
+    // Point the tree away from the way just touched.
+    task automatic plru_touch(input int st, input logic [WAY_W-1:0] w);
+        begin
+            plru[st][0] <= ~w[2];
+            if (!w[2]) plru[st][1] <= ~w[1];
+            else       plru[st][2] <= ~w[1];
+            case (w[2:1])
+                2'b00:   plru[st][3] <= ~w[0];
+                2'b01:   plru[st][4] <= ~w[0];
+                2'b10:   plru[st][5] <= ~w[0];
+                default: plru[st][6] <= ~w[0];
+            endcase
+        end
+    endtask
 
     // ---- fill / write state ----
     localparam logic [1:0] S_IDLE = 2'd0, S_FILL = 2'd1, S_WRITE = 2'd2;
     logic [1:0] state;
 
-    logic [IDX_W-1:0] f_idx;
+    logic [IDX_W-1:0] f_set;
     logic [TAG_W-1:0] f_tag;
-    logic [OFF_W-1:0] f_off;          // word being fetched; wraps within the line
+    logic [WAY_W-1:0] f_way;
+    logic [OFF_W-1:0] f_off;          // word being fetched; wraps in the line
     logic [OFF_W:0]   f_cnt;          // how many of the line have landed
-    logic             f_poison;       // a snoop hit us mid-fill; do not validate
-    logic             gap;            // one idle cycle between memory requests
+    logic             f_poison;       // a snoop hit us mid-fill
+    logic             gap;            // one idle cycle between requests
 
     logic             w_hit;
-    logic [MEM_W-1:0] w_ma;
+    logic [SA_W-1:0]  w_sa;
+    logic [WAY_W-1:0] w_way;
 
     // ---- next-line prefetch ----
-    // THE MEMORY PATH IS BLOCKING: one fill in flight, and an arbiter that
-    // serves one requester at a time. A prefetch therefore occupies the exact
-    // port a demand miss needs, and on a blocking path a badly timed prefetch
-    // does not merely fail to help -- it delays real work and makes the
-    // machine slower. So this one is ABANDONABLE: it only starts when nothing
-    // is being asked for, and the moment a demand access arrives it stops,
-    // leaving the line invalid rather than finishing it.
-    //
-    // Abandoning is safe because `valid` is only set at fill_last. A
-    // half-filled line is simply never a hit, and the worst case is that the
-    // work was wasted -- not that a stale line is left behind.
-    //
-    // Why next-line: 27% of the machine's cycles are string operations
-    // walking memory sequentially with half of that spent waiting on SDRAM,
-    // which is the pattern next-line prefetch is shaped for.
-    //
-    // IT DOES NOT WORK HERE, AND IT IS OFF. Measured on the MS-DOS boot:
-    //
-    //                      CPI     instructions   SDRAM stall
-    //     PREFETCH = 0    18.36      1,078,332       26.1%
-    //     PREFETCH = 1    19.81        999,479       29.7%
-    //
-    // It retires 7.3% FEWER instructions and stalls MORE, and the string
-    // states it was aimed at got worse, not better. Two reasons, both
-    // properties of the memory system rather than of this logic:
-    //
-    //   Abandoning is too coarse. A bus cycle cannot be recalled, so a
-    //   demand access waits up to a whole word transaction behind a prefetch
-    //   that guessed wrong about timing. That is pure latency on the
-    //   critical path.
-    //
-    //   The cache is DIRECT MAPPED, so every prefetch is also an eviction.
-    //   A wrong guess costs bandwidth and destroys a line that was in use.
-    //
-    // Turning this on needs the memory system underneath it to change first:
-    // a non-blocking cache with MSHRs so a prefetch can never sit in front
-    // of a demand access, or a separate prefetch buffer that does not evict,
-    // or stream detection so it only fires on a confirmed sequential run.
-    // The logic is kept, parameterised and tested, so that becomes a
-    // one-line experiment once any of those exists.
-    logic             pf_pending;   // a line is queued to be prefetched
+    // See the note at the end of this file: it is measured and it LOSES on
+    // this memory system, so PREFETCH defaults off. The logic is kept because
+    // the mechanism is sound and the memory path is what is not ready.
+    logic             pf_pending;
     logic [TAG_W-1:0] pf_tag;
-    logic [IDX_W-1:0] pf_idx;
-    logic             is_pf;        // the fill in flight is a prefetch
-    logic             pf_abort;
+    logic [IDX_W-1:0] pf_set;
+    logic             is_pf;
+    logic             pf_abort, pf_start;
 
     logic hit_now, miss_now, wr_now, fill_ack, fill_last, write_ack;
     logic snoop_flush;
 
-    assign hit_now   = (state == S_IDLE) && lu_ok && c_rd && !c_wr &&  hit;
-    assign miss_now  = (state == S_IDLE) && lu_ok && c_rd && !c_wr && !hit;
+    assign hit_now   = (state == S_IDLE) && lu_ok && c_rd && !c_wr &&  hit_any;
+    assign miss_now  = (state == S_IDLE) && lu_ok && c_rd && !c_wr && !hit_any;
     assign wr_now    = (state == S_IDLE) && lu_ok && c_wr;
-    // !is_pf IS LOAD-BEARING. fill_ack asserts c_ready and forwards the
-    // word straight to the CPU, which is right for a demand miss -- it is
-    // the critical-word-first path. For a PREFETCH nobody asked for the
-    // word, so firing it hands the CPU data from an address it never
-    // requested. A read waiting for the port takes that as its answer, and
-    // the machine executes whatever happened to be prefetched. It boots
-    // right up to the point where it does not.
+    // !is_pf is load-bearing: a prefetch must never answer the CPU. fill_ack
+    // forwards the word straight out and asserts c_ready, which is right for
+    // a demand miss and catastrophic for a prefetch -- a waiting read would
+    // take data from an address it never asked for.
     assign fill_ack  = (state == S_FILL) && m_ready && (f_cnt == '0) && !is_pf;
-    assign fill_last = (state == S_FILL)  && m_ready &&
+    assign fill_last = (state == S_FILL) && m_ready &&
                        (f_cnt == LINE_WORDS[OFF_W:0] - 1);
     assign write_ack = (state == S_WRITE) && m_ready;
 
-    // A demand access while a prefetch is filling. The current word has to be
-    // allowed to land -- a bus cycle cannot be recalled once issued -- so the
-    // abort waits for m_ready and then gives the port back.
-    //
-    // NO LATCH IS NEEDED on the demand request, which is worth stating
-    // because it looks like one should be: m_ready is a single-cycle pulse
-    // and coinciding with it seems unlikely. It is not, because a demand
-    // access that cannot be served holds c_rd high until it IS served -- so
-    // it is guaranteed to still be asserted when the next word lands. A
-    // latch was added here on the strength of the wrong argument and removed
-    // again when reverting it changed no test.
-    assign pf_abort = is_pf && (c_rd || c_wr) && m_ready;
+    // Only writes BELOW 1 MB can alias anything the CPU can address, so the
+    // disk image traffic above that -- which is all of it today -- costs
+    // nothing at all.
+    assign snoop_flush = snoop_wr && (snoop_addr < 24'h100000);
 
-    // Start only when the CPU wants nothing. lu_ok keeps it off the cycle
-    // after an array write, for the same reason the demand path waits.
-    logic pf_start;
+    // A demand access while a prefetch is filling. No latch is needed on the
+    // request, which looks wrong but is not: an access that cannot be served
+    // holds c_rd high until it IS served, so it is still asserted when the
+    // next word lands.
+    assign pf_abort = is_pf && (c_rd || c_wr) && m_ready;
     assign pf_start = PREFETCH && pf_pending && !c_rd && !c_wr && lu_ok
                       && (state == S_IDLE);
 
@@ -277,22 +342,16 @@ module cache #(
     assign stat_pf_done  = fill_last && is_pf && !pf_abort;
     assign stat_pf_abort = pf_abort;
 
-    // Only writes BELOW 1 MB can alias anything the CPU can address, so the
-    // disk image traffic above that -- which is all of it today -- costs
-    // nothing at all.
-    assign snoop_flush = snoop_wr && (snoop_addr < 24'h100000);
-
     // ---- memory port ----
     // The arbiter's contract is one access per request, so rd/wr must drop
-    // between words of a fill; `gap` is that cycle. Holding it up instead
-    // would start a second unasked-for access.
+    // between words of a fill; `gap` is that cycle.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) gap <= 1'b0;
         else        gap <= m_ready;
     end
 
     logic [18:0] f_word;
-    assign f_word = {f_tag, f_idx, f_off};
+    assign f_word = {f_tag, f_set, f_off};
 
     always_comb begin
         if (state == S_FILL) begin
@@ -317,30 +376,48 @@ module cache #(
     end
 
     // ---- data array write port ----
-    // Two writers, and they cannot collide: a fill only runs in S_FILL and a
-    // write-hit update only in S_WRITE.
-    logic [MEM_W-1:0] wr_ma;
+    // Two writers that cannot collide: a fill only runs in S_FILL and a
+    // write-hit update only in S_WRITE. The way selects which byte lane of
+    // the wide word is written.
+    logic [SA_W-1:0]  wr_sa;
+    logic [WAY_W-1:0] wr_way;
     logic [15:0]      wr_dat;
     logic [1:0]       wr_en;
 
     always_comb begin
-        wr_ma  = {f_idx, f_off};
+        wr_sa  = {f_set, f_off};
+        wr_way = f_way;
         wr_dat = m_rdata;
         wr_en  = 2'b00;
         if (state == S_FILL && m_ready) begin
             wr_en = 2'b11;
         end else if (write_ack && w_hit) begin
-            wr_ma  = w_ma;
+            wr_sa  = w_sa;
+            wr_way = w_way;
             wr_dat = c_wdata;
             wr_en  = c_be;
         end
     end
 
-    always_ff @(posedge clk) begin
-        if (wr_en[0]) dat_lo[wr_ma] <= wr_dat[7:0];
-        if (wr_en[1]) dat_hi[wr_ma] <= wr_dat[15:8];
-        if (fill_last && !f_poison && !snoop_flush) tag_mem[f_idx] <= f_tag;
-    end
+    genvar gw;
+    generate
+        for (gw = 0; gw < WAYS; gw++) begin : g_way
+            always_ff @(posedge clk) begin
+                // Read every way each cycle; the tag compare picks one after.
+                r_tags[gw] <= tag_mem[gw][c_set];
+                r_lo[gw]   <= dat_lo[gw][c_sa];
+                r_hi[gw]   <= dat_hi[gw][c_sa];
+                // Constant way index, so each of these is a plain RAM.
+                if (wr_en[0] && wr_way == gw[WAY_W-1:0])
+                    dat_lo[gw][wr_sa] <= wr_dat[7:0];
+                if (wr_en[1] && wr_way == gw[WAY_W-1:0])
+                    dat_hi[gw][wr_sa] <= wr_dat[15:8];
+                if (fill_last && !f_poison && !snoop_flush
+                    && f_way == gw[WAY_W-1:0])
+                    tag_mem[gw][f_set] <= f_tag;
+            end
+        end
+    endgenerate
 
     // The tag is only ever written in a cycle that also writes data, so one
     // flag covers both arrays.
@@ -349,45 +426,54 @@ module cache #(
         else        arr_wr_d <= |wr_en;
     end
 
-    // ---- valid bits ----
+    // ---- valid bits and PLRU ----
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            valid <= '0;
+            for (int st = 0; st < SETS; st++) begin
+                valid[st] <= '0;
+                plru[st]  <= '0;
+            end
         end else if (snoop_flush) begin
-            // Conservative and deliberate: a foreign write to low memory drops
-            // everything, including a line that is mid-fill.
-            valid <= '0;
+            // Conservative and deliberate: a foreign write to low memory
+            // drops everything, including a line that is mid-fill.
+            for (int st = 0; st < SETS; st++) valid[st] <= '0;
         end else begin
             // Clear on the way in, set on the way out, so a half-filled line
             // is never a candidate for a hit even for one cycle.
-            if (miss_now)                    valid[r_idx] <= 1'b0;
-            // A PREFETCH MUST INVALIDATE ITS TARGET LINE TOO. The cache is
-            // direct mapped, so the line being prefetched shares an index
-            // with whatever is resident there -- and the fill writes into
-            // the data array immediately. Without this the prefetch
-            // overwrites a DIFFERENT line's data while its tag and valid bit
-            // still say it is good, and the cache then serves that corrupted
-            // line as a hit. The unit tests missed it entirely; the machine
-            // simply stopped booting.
-            if (pf_start)                    valid[pf_idx] <= 1'b0;
-            if (fill_last && !f_poison)      valid[f_idx] <= 1'b1;
+            if (miss_now) valid[r_set][victim] <= 1'b0;
+            // A prefetch must invalidate its target too: the fill writes the
+            // data array immediately but only fixes the tag at the end, so
+            // without this it overwrites another line's data while that
+            // line's tag and valid bit still say it is good.
+            if (pf_start) valid[pf_set][victim] <= 1'b0;
+            if (fill_last && !f_poison) valid[f_set][f_way] <= 1'b1;
+
+            // PLRU is updated on every access that USES a way: a hit, and the
+            // fill that installs a line. A prefetch deliberately does not
+            // touch it -- nobody asked for that line, so it should not count
+            // as recently used and push out something that was.
+            if (hit_now)                          plru_touch(r_set, hit_way);
+            if (write_ack && w_hit)               plru_touch(r_set, w_way);
+            if (fill_last && !f_poison && !is_pf) plru_touch(f_set, f_way);
         end
     end
 
     // ---- the state machine ----
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state    <= S_IDLE;
-            f_idx    <= '0;
-            f_tag    <= '0;
-            f_off    <= '0;
-            f_cnt    <= '0;
+            state      <= S_IDLE;
+            f_set      <= '0;
+            f_tag      <= '0;
+            f_way      <= '0;
+            f_off      <= '0;
+            f_cnt      <= '0;
             f_poison   <= 1'b0;
             w_hit      <= 1'b0;
-            w_ma       <= '0;
+            w_sa       <= '0;
+            w_way      <= '0;
             pf_pending <= 1'b0;
             pf_tag     <= '0;
-            pf_idx     <= '0;
+            pf_set     <= '0;
             is_pf      <= 1'b0;
         end else begin
             if (snoop_flush && state == S_FILL) f_poison <= 1'b1;
@@ -395,36 +481,37 @@ module cache #(
             case (state)
                 S_IDLE: begin
                     if (miss_now) begin
-                        f_idx    <= r_idx;
+                        f_set    <= r_set;
                         f_tag    <= r_tag;
-                        f_off    <= r_ma[OFF_W-1:0];   // critical word first
+                        f_way    <= victim;
+                        f_off    <= r_off;             // critical word first
                         f_cnt    <= '0;
                         f_poison <= snoop_flush;
                         is_pf    <= 1'b0;
                         state    <= S_FILL;
                     end else if (wr_now) begin
-                        w_hit <= hit;
-                        w_ma  <= r_ma;
+                        w_hit <= hit_any;
+                        w_sa  <= r_sa;
+                        w_way <= hit_way;
                         state <= S_WRITE;
                     end else if (pf_start) begin
                         // Demand work always wins: this arm is only reached
                         // when the CPU is asking for nothing at all.
-                        f_idx      <= pf_idx;
-                        f_tag      <= pf_tag;
-                        f_off      <= '0;
-                        f_cnt      <= '0;
-                        f_poison   <= snoop_flush;
-                        is_pf      <= 1'b1;
+                        f_set    <= pf_set;
+                        f_tag    <= pf_tag;
+                        f_way    <= victim;
+                        f_off    <= '0;
+                        f_cnt    <= '0;
+                        f_poison <= snoop_flush;
+                        is_pf    <= 1'b1;
                         pf_pending <= 1'b0;
-                        state      <= S_FILL;
+                        state    <= S_FILL;
                     end
                 end
 
                 S_FILL: begin
                     if (pf_abort) begin
-                        // Give the port back without validating the line. A
-                        // half-filled line is never a hit, so the only cost
-                        // is the work already done.
+                        // Give the port back without validating the line.
                         is_pf <= 1'b0;
                         state <= S_IDLE;
                     end else if (m_ready) begin
@@ -434,13 +521,11 @@ module cache #(
                             f_poison <= 1'b0;
                             is_pf    <= 1'b0;
                             state    <= S_IDLE;
-                            // Queue the following line, but only after a
-                            // DEMAND miss. Chaining prefetches off prefetches
-                            // would run ahead of the program indefinitely,
-                            // filling the cache with lines nobody asked for
-                            // and evicting ones that were.
+                            // Only after a DEMAND miss. Chaining prefetches
+                            // off prefetches would run ahead of the program
+                            // indefinitely.
                             if (!is_pf) begin
-                                {pf_tag, pf_idx} <= {f_tag, f_idx} + 1'b1;
+                                {pf_tag, pf_set} <= {f_tag, f_set} + 1'b1;
                                 pf_pending       <= 1'b1;
                             end
                         end
@@ -468,7 +553,7 @@ module cache #(
     end
 
     always_ff @(posedge clk) begin
-        if (hit_now)       hold <= r_data;
+        if (hit_now)       hold <= hit_data;
         else if (fill_ack) hold <= m_rdata;
     end
 
@@ -478,15 +563,26 @@ module cache #(
     assign c_ready = hit_ack || fill_ack || write_ack;
 
     // ---- statistics ----
-    // One pulse per access, taken on the rising edge of the request so a
-    // multi-cycle wait is not counted several times.
     logic acc_d;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) acc_d <= 1'b0;
         else        acc_d <= c_rd || c_wr;
     end
 
-    assign stat_hit  = (c_rd || c_wr) && !acc_d &&  hit;
-    assign stat_miss = (c_rd || c_wr) && !acc_d && !hit;
+    assign stat_hit  = (c_rd || c_wr) && !acc_d &&  hit_any;
+    assign stat_miss = (c_rd || c_wr) && !acc_d && !hit_any;
+
+    // ---- the prefetch measurement ----
+    // Measured on the MS-DOS boot, direct-mapped 8 KB:
+    //
+    //                      CPI     instructions   SDRAM stall
+    //     PREFETCH = 0    18.36      1,078,332       26.1%
+    //     PREFETCH = 1    19.81        999,479       29.7%
+    //
+    // It retired 7.3% FEWER instructions. Abandoning is too coarse -- a bus
+    // cycle cannot be recalled, so a demand access waits up to a whole word
+    // transaction behind a wrong guess -- and in a direct-mapped cache every
+    // prefetch was also an eviction. Set associativity removes the second
+    // reason, so this is worth re-measuring now.
 
 endmodule
