@@ -64,6 +64,61 @@ if {![file exists $imgfile]} {
     exit 1
 }
 
+# ---- is this an image the BIOS can actually read? ----
+# THE FAILURE THIS CATCHES looks nothing like its cause. The BIOS's INT 13h
+# translates CHS to LBA with the geometry it was BUILT for (rom/geometry.py,
+# written by img2hex.py from the image the BIOS was made for). Hand it a 1.44 MB
+# floppy instead and sector 0 still reads correctly -- LBA 0 is LBA 0 under any
+# geometry -- so the boot sector loads and runs. The very next read, the root
+# directory at floppy LBA 19 = CHS(0,1,2), is translated with the wrong
+# sectors-per-track and lands somewhere else entirely. What you see is
+#
+#     Boot sector loaded, starting.
+#     Non-System disk or disk error
+#
+# which reads like a corrupt or non-bootable disk and sends you looking at the
+# filesystem, the loader and the storage controller, none of which are wrong.
+# The README told you to load ms-dos/disk01.img for long enough after the BIOS
+# moved to a 16 MB disk that this is worth a check rather than a comment.
+set geo_spt 0
+set geo_sectors 0
+set geofile [file join [file dirname [info script]] .. rom geometry.py]
+if {[file exists $geofile]} {
+    set gf [open $geofile r]
+    foreach gline [split [read $gf] "\n"] {
+        if {[regexp {^SPT\s*=\s*(\d+)} $gline -> v]}     { set geo_spt $v }
+        if {[regexp {^SECTORS\s*=\s*(\d+)} $gline -> v]} { set geo_sectors $v }
+    }
+    close $gf
+}
+if {$geo_sectors > 0} {
+    set img_sectors [expr {[file size $imgfile] / 512}]
+    # A smaller image is fine -- the disk is simply short, and nothing reads
+    # past the end. What is NOT fine is an image laid out for a different
+    # geometry, and the sectors-per-track a FAT BPB carries is how to tell.
+    set bf [open $imgfile rb]
+    fconfigure $bf -translation binary
+    set boot [read $bf 512]
+    close $bf
+    binary scan [string range $boot 24 25] su img_spt
+    if {$img_spt > 0 && $img_spt != $geo_spt} {
+        puts ""
+        puts "error: $imgfile is laid out for $img_spt sectors per track, but the"
+        puts "       BIOS on this board translates INT 13h with $geo_spt."
+        puts ""
+        puts "       Sector 0 would load and the boot sector would run, then the"
+        puts "       first read past it would land at the wrong LBA and MS-DOS"
+        puts "       would report \"Non-System disk or disk error\"."
+        puts ""
+        puts "       Load a $geo_spt-sector-per-track image (ms-dos/dos.img), or"
+        puts "       rebuild the BIOS for this one:"
+        puts "         python3 tools/img2hex.py $imgfile   # rewrites rom/geometry.py"
+        puts "         python3 tools/gen_bios.py rom"
+        puts "       and recompile."
+        exit 1
+    }
+}
+
 # ---- find the cable and device ----
 set cables [get_hardware_names]
 if {[llength $cables] == 0} {

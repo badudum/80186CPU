@@ -707,7 +707,7 @@ needing a rebuild.
 
 ```sh
 quartus_pgm -m jtag -o "p;output_files/FPGA80186.sof@2"
-quartus_stp -t tools/jtag_load.tcl ms-dos/disk01.img
+quartus_stp -t tools/jtag_load.tcl ms-dos/dos.img
 ```
 
 A virtual JTAG node with four instructions: set the pointer, stream words, hold
@@ -764,17 +764,36 @@ the start of every line.
 ```sh
 quartus_pgm -m jtag -o "p;output_files/FPGA80186.sof@2"
 jtagconfig --setparam "DE-SoC [4-2]" JtagClock 6M
-quartus_stp -t tools/jtag_load.tcl ms-dos/disk01.img
+quartus_stp -t tools/jtag_load.tcl ms-dos/dos.img
 ```
 
 That boots the real thing: the MS-DOS boot sector, `IO.SYS`, `MSDOS.SYS`,
-`COMMAND.COM`, `AUTOEXEC.BAT`, and — because Disk 1 of a 6.22 set is the Setup
-disk — `SETUP.EXE`, which paints its full-screen installer and waits at
-**ENTER=Continue** for a PS/2 keyboard.
+`COMMAND.COM` and `AUTOEXEC.BAT`, to an `A:\>` prompt.
 
-Setup will not get far: it installs to a hard disk and this machine has one
-floppy. Renaming `AUTOEXEC.BAT` in the image before loading it gives a bare
-`A:\>` prompt instead.
+**Load the 16 MB image, not the 1.44 MB floppy.** The BIOS's INT 13h converts
+the CHS a boot sector asks for back into an LBA using the geometry it was BUILT
+with — `rom/geometry.py`, which `tools/img2hex.py` writes from the BPB of the
+image it was made for. Since the machine moved to a 16 MB disk that geometry is
+63 sectors per track, and `ms-dos/disk01.img` is an 18-sector-per-track floppy.
+
+Hand it the floppy and the failure does not look like a mismatched constant:
+
+```
+Boot sector loaded, starting.
+Non-System disk or disk error
+```
+
+Sector 0 reads correctly, because LBA 0 is LBA 0 under any geometry, so the
+boot sector loads and runs. The very next read — the root directory, where it
+looks for `IO.SYS` — is translated with the wrong sectors-per-track and lands
+somewhere else entirely. It reads like a corrupt or non-bootable disk and sends
+you to the filesystem, the loader and the storage controller, none of which are
+wrong. `tools/jtag_load.tcl` now compares the image's BPB against the BIOS's
+geometry and refuses the load rather than letting you find out this way.
+
+The floppy is still the right image for `./sim/run.sh tb_msdos`, which builds
+its own BIOS into `rom/fast/`; keep the two in step by rebuilding that BIOS
+whenever the geometry changes.
 
 The image is loaded into SDRAM over the USB-Blaster and is **not** part of the
 bitstream; MS-DOS is Microsoft's, so nothing from `ms-dos/` is committed here.

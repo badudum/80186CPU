@@ -59,7 +59,21 @@ module tb_msdos;
     defparam dut.u_clk_rst.DEBOUNCE = 20;
     defparam dut.u_mem.SDRAM_INIT_CYCLES = 40;
     // A BIOS whose timer ticks 64x too fast, built by
-    //   python3 tools/gen_bios.py rom/fast --fast-tick
+    //   python3 tools/gen_bios.py rom/fast --fast-tick --geometry 18,2,2880
+    //
+    // THE GEOMETRY IS NOT OPTIONAL AND MUST MATCH THE IMAGE BELOW. This
+    // testbench boots ms-dos/disk01.img, a 1.44 MB floppy whose BPB declares
+    // 18 sectors per track and 2 heads; the ROM that goes on the board is
+    // built from rom/geometry.py, which describes the 16 MB disk hardware
+    // boots instead. INT 13h converts the CHS a boot sector asks for back into
+    // an LBA using whichever geometry it was built with, so a ROM built for
+    // the wrong one reads sector 0 correctly -- LBA 0 is LBA 0 either way --
+    // and then lands every subsequent read somewhere else, which MS-DOS
+    // reports as "Non-System disk or disk error".
+    //
+    // This used to depend on the order gen_bios.py and img2hex.py happened to
+    // run in, and was recorded nowhere. Naming it on the command line is what
+    // makes this ROM reproducible.
     // MS-DOS times its startup waits in ticks, and at the real 18.2 Hz the
     // F5/F8 prompt alone is fifty million clocks of doing nothing. This is the
     // only difference from the ROM that goes on the board.

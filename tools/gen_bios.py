@@ -162,15 +162,36 @@ SPT = 16
 HEADS = 4
 SECTORS = 256
 
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "rom"))
-    from geometry import SPT as _SPT, HEADS as _HEADS, SECTORS as _SECTORS  # noqa: E402
-    SPT, HEADS, SECTORS = _SPT, _HEADS, _SECTORS
-    print("geometry from rom/geometry.py: SPT=%d HEADS=%d SECTORS=%d"
+# `--geometry SPT,HEADS,SECTORS` overrides rom/geometry.py. THIS EXISTS BECAUSE
+# THE DEFAULT IS INVISIBLE: rom/geometry.py is a generated file, rewritten by
+# img2hex.py whenever an image is uploaded, so which geometry a ROM was built
+# with depended on the ORDER two tools happened to run in and was recorded
+# nowhere. The simulation ROM in rom/fast/ was built for an 18-sector floppy
+# moments before img2hex.py rewrote the geometry to a 63-sector disk, and from
+# then on the board and sim/tb_msdos.sv were running BIOSes that disagreed
+# about the disk -- which is invisible until a rebuild silently changes one of
+# them. Naming the geometry makes a ROM reproducible from its command line.
+_GEO_ARG = None
+for _i, _a in enumerate(sys.argv):
+    if _a == "--geometry" and _i + 1 < len(sys.argv):
+        _GEO_ARG = sys.argv[_i + 1]
+sys.argv = [a for a in sys.argv if a != "--geometry" and a != _GEO_ARG] \
+    if _GEO_ARG else sys.argv
+
+if _GEO_ARG:
+    SPT, HEADS, SECTORS = (int(v) for v in _GEO_ARG.split(","))
+    print("geometry from --geometry: SPT=%d HEADS=%d SECTORS=%d"
           % (SPT, HEADS, SECTORS))
-except ImportError:
-    pass
+else:
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "..", "rom"))
+        from geometry import SPT as _SPT, HEADS as _HEADS, SECTORS as _SECTORS  # noqa: E402
+        SPT, HEADS, SECTORS = _SPT, _HEADS, _SECTORS
+        print("geometry from rom/geometry.py: SPT=%d HEADS=%d SECTORS=%d"
+              % (SPT, HEADS, SECTORS))
+    except ImportError:
+        pass
 
 # INT 13h AH=08 reports the LAST cylinder, not the count.
 CYLS = max(1, SECTORS // (SPT * HEADS))
