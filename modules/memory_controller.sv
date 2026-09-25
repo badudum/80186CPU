@@ -194,8 +194,11 @@ module memory_controller #(
                     .m_ready    (arb_ready[0]),
                     .snoop_wr   (snoop_wr),
                     .snoop_addr (snoop_addr),
-                    .stat_hit   (),
-                    .stat_miss  ()
+                    .stat_hit      (),
+                    .stat_miss     (),
+                    .stat_pf_start (),
+                    .stat_pf_done  (),
+                    .stat_pf_abort ()
                 );
 
                 assign arb_rd[0]    = ca_rd;

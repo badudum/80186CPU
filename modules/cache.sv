@@ -61,7 +61,10 @@
 `timescale 1ns/1ns
 module cache #(
     parameter int KB         = 8,
-    parameter int LINE_WORDS = 4
+    parameter int LINE_WORDS = 4,
+    // Next-line prefetch. OFF, because it was measured and it LOSES: see the
+    // note above the prefetch logic for the numbers and the reason.
+    parameter bit PREFETCH   = 1'b0
 ) (
     input  logic        clk,
     input  logic        rst_n,
@@ -92,7 +95,10 @@ module cache #(
 
     // ---- counters for the testbenches; no function in hardware ----
     output logic        stat_hit,
-    output logic        stat_miss
+    output logic        stat_miss,
+    output logic        stat_pf_start,   // a prefetch was begun
+    output logic        stat_pf_done,    // ...and it completed
+    output logic        stat_pf_abort
 );
 
     localparam int WORDS = (KB * 1024) / 2;
@@ -183,16 +189,93 @@ module cache #(
     logic             w_hit;
     logic [MEM_W-1:0] w_ma;
 
+    // ---- next-line prefetch ----
+    // THE MEMORY PATH IS BLOCKING: one fill in flight, and an arbiter that
+    // serves one requester at a time. A prefetch therefore occupies the exact
+    // port a demand miss needs, and on a blocking path a badly timed prefetch
+    // does not merely fail to help -- it delays real work and makes the
+    // machine slower. So this one is ABANDONABLE: it only starts when nothing
+    // is being asked for, and the moment a demand access arrives it stops,
+    // leaving the line invalid rather than finishing it.
+    //
+    // Abandoning is safe because `valid` is only set at fill_last. A
+    // half-filled line is simply never a hit, and the worst case is that the
+    // work was wasted -- not that a stale line is left behind.
+    //
+    // Why next-line: 27% of the machine's cycles are string operations
+    // walking memory sequentially with half of that spent waiting on SDRAM,
+    // which is the pattern next-line prefetch is shaped for.
+    //
+    // IT DOES NOT WORK HERE, AND IT IS OFF. Measured on the MS-DOS boot:
+    //
+    //                      CPI     instructions   SDRAM stall
+    //     PREFETCH = 0    18.36      1,078,332       26.1%
+    //     PREFETCH = 1    19.81        999,479       29.7%
+    //
+    // It retires 7.3% FEWER instructions and stalls MORE, and the string
+    // states it was aimed at got worse, not better. Two reasons, both
+    // properties of the memory system rather than of this logic:
+    //
+    //   Abandoning is too coarse. A bus cycle cannot be recalled, so a
+    //   demand access waits up to a whole word transaction behind a prefetch
+    //   that guessed wrong about timing. That is pure latency on the
+    //   critical path.
+    //
+    //   The cache is DIRECT MAPPED, so every prefetch is also an eviction.
+    //   A wrong guess costs bandwidth and destroys a line that was in use.
+    //
+    // Turning this on needs the memory system underneath it to change first:
+    // a non-blocking cache with MSHRs so a prefetch can never sit in front
+    // of a demand access, or a separate prefetch buffer that does not evict,
+    // or stream detection so it only fires on a confirmed sequential run.
+    // The logic is kept, parameterised and tested, so that becomes a
+    // one-line experiment once any of those exists.
+    logic             pf_pending;   // a line is queued to be prefetched
+    logic [TAG_W-1:0] pf_tag;
+    logic [IDX_W-1:0] pf_idx;
+    logic             is_pf;        // the fill in flight is a prefetch
+    logic             pf_abort;
+
     logic hit_now, miss_now, wr_now, fill_ack, fill_last, write_ack;
     logic snoop_flush;
 
     assign hit_now   = (state == S_IDLE) && lu_ok && c_rd && !c_wr &&  hit;
     assign miss_now  = (state == S_IDLE) && lu_ok && c_rd && !c_wr && !hit;
     assign wr_now    = (state == S_IDLE) && lu_ok && c_wr;
-    assign fill_ack  = (state == S_FILL)  && m_ready && (f_cnt == '0);
+    // !is_pf IS LOAD-BEARING. fill_ack asserts c_ready and forwards the
+    // word straight to the CPU, which is right for a demand miss -- it is
+    // the critical-word-first path. For a PREFETCH nobody asked for the
+    // word, so firing it hands the CPU data from an address it never
+    // requested. A read waiting for the port takes that as its answer, and
+    // the machine executes whatever happened to be prefetched. It boots
+    // right up to the point where it does not.
+    assign fill_ack  = (state == S_FILL) && m_ready && (f_cnt == '0) && !is_pf;
     assign fill_last = (state == S_FILL)  && m_ready &&
                        (f_cnt == LINE_WORDS[OFF_W:0] - 1);
     assign write_ack = (state == S_WRITE) && m_ready;
+
+    // A demand access while a prefetch is filling. The current word has to be
+    // allowed to land -- a bus cycle cannot be recalled once issued -- so the
+    // abort waits for m_ready and then gives the port back.
+    //
+    // NO LATCH IS NEEDED on the demand request, which is worth stating
+    // because it looks like one should be: m_ready is a single-cycle pulse
+    // and coinciding with it seems unlikely. It is not, because a demand
+    // access that cannot be served holds c_rd high until it IS served -- so
+    // it is guaranteed to still be asserted when the next word lands. A
+    // latch was added here on the strength of the wrong argument and removed
+    // again when reverting it changed no test.
+    assign pf_abort = is_pf && (c_rd || c_wr) && m_ready;
+
+    // Start only when the CPU wants nothing. lu_ok keeps it off the cycle
+    // after an array write, for the same reason the demand path waits.
+    logic pf_start;
+    assign pf_start = PREFETCH && pf_pending && !c_rd && !c_wr && lu_ok
+                      && (state == S_IDLE);
+
+    assign stat_pf_start = pf_start;
+    assign stat_pf_done  = fill_last && is_pf && !pf_abort;
+    assign stat_pf_abort = pf_abort;
 
     // Only writes BELOW 1 MB can alias anything the CPU can address, so the
     // disk image traffic above that -- which is all of it today -- costs
@@ -278,6 +361,15 @@ module cache #(
             // Clear on the way in, set on the way out, so a half-filled line
             // is never a candidate for a hit even for one cycle.
             if (miss_now)                    valid[r_idx] <= 1'b0;
+            // A PREFETCH MUST INVALIDATE ITS TARGET LINE TOO. The cache is
+            // direct mapped, so the line being prefetched shares an index
+            // with whatever is resident there -- and the fill writes into
+            // the data array immediately. Without this the prefetch
+            // overwrites a DIFFERENT line's data while its tag and valid bit
+            // still say it is good, and the cache then serves that corrupted
+            // line as a hit. The unit tests missed it entirely; the machine
+            // simply stopped booting.
+            if (pf_start)                    valid[pf_idx] <= 1'b0;
             if (fill_last && !f_poison)      valid[f_idx] <= 1'b1;
         end
     end
@@ -290,9 +382,13 @@ module cache #(
             f_tag    <= '0;
             f_off    <= '0;
             f_cnt    <= '0;
-            f_poison <= 1'b0;
-            w_hit    <= 1'b0;
-            w_ma     <= '0;
+            f_poison   <= 1'b0;
+            w_hit      <= 1'b0;
+            w_ma       <= '0;
+            pf_pending <= 1'b0;
+            pf_tag     <= '0;
+            pf_idx     <= '0;
+            is_pf      <= 1'b0;
         end else begin
             if (snoop_flush && state == S_FILL) f_poison <= 1'b1;
 
@@ -304,21 +400,49 @@ module cache #(
                         f_off    <= r_ma[OFF_W-1:0];   // critical word first
                         f_cnt    <= '0;
                         f_poison <= snoop_flush;
+                        is_pf    <= 1'b0;
                         state    <= S_FILL;
                     end else if (wr_now) begin
                         w_hit <= hit;
                         w_ma  <= r_ma;
                         state <= S_WRITE;
+                    end else if (pf_start) begin
+                        // Demand work always wins: this arm is only reached
+                        // when the CPU is asking for nothing at all.
+                        f_idx      <= pf_idx;
+                        f_tag      <= pf_tag;
+                        f_off      <= '0;
+                        f_cnt      <= '0;
+                        f_poison   <= snoop_flush;
+                        is_pf      <= 1'b1;
+                        pf_pending <= 1'b0;
+                        state      <= S_FILL;
                     end
                 end
 
                 S_FILL: begin
-                    if (m_ready) begin
+                    if (pf_abort) begin
+                        // Give the port back without validating the line. A
+                        // half-filled line is never a hit, so the only cost
+                        // is the work already done.
+                        is_pf <= 1'b0;
+                        state <= S_IDLE;
+                    end else if (m_ready) begin
                         f_off <= f_off + 1'b1;         // wraps inside the line
                         f_cnt <= f_cnt + 1'b1;
                         if (fill_last) begin
                             f_poison <= 1'b0;
+                            is_pf    <= 1'b0;
                             state    <= S_IDLE;
+                            // Queue the following line, but only after a
+                            // DEMAND miss. Chaining prefetches off prefetches
+                            // would run ahead of the program indefinitely,
+                            // filling the cache with lines nobody asked for
+                            // and evicting ones that were.
+                            if (!is_pf) begin
+                                {pf_tag, pf_idx} <= {f_tag, f_idx} + 1'b1;
+                                pf_pending       <= 1'b1;
+                            end
                         end
                     end
                 end

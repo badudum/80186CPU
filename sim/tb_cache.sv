@@ -40,8 +40,20 @@ module tb_cache;
     logic        snoop_wr = 0;
     logic [23:0] snoop_addr = 0;
     logic        stat_hit, stat_miss;
+    logic        stat_pf_start, stat_pf_done, stat_pf_abort;
+    int pf_starts = 0, pf_dones = 0, pf_aborts = 0;
+    always @(posedge clk) begin
+        if (stat_pf_start) pf_starts++;
+        if (stat_pf_done)  pf_dones++;
+        if (stat_pf_abort) pf_aborts++;
+    end
 
-    cache #(.KB(KB), .LINE_WORDS(LINE_WORDS)) dut (.*);
+    // PREFETCH is forced ON here. It is OFF by default because measuring it
+    // on the MS-DOS boot showed it losing -- CPI 18.36 to 19.81 -- but the
+    // logic still has to be correct for the day the memory system can carry
+    // it, and three real bugs in it were only found by these checks plus a
+    // full-system boot.
+    cache #(.KB(KB), .LINE_WORDS(LINE_WORDS), .PREFETCH(1'b1)) dut (.*);
 
     always #5 clk = ~clk;
 
@@ -320,6 +332,138 @@ module tb_cache;
         flush('h100000);                 // the disk image, which cannot alias
         t_read('h00500, d, c2);
         chk("a write above 1 MB left the cache alone", c2, 3);
+
+        // ---- next-line prefetch ----
+        // The line after a demand miss should arrive without being asked
+        // for, so a sequential walk stops missing after the first line.
+        flush('h000000);
+        settle();
+        t_read('h01000, d, c2);                 // cold miss on one line
+        chk("the missing line was fetched", d, 16'h1000 + 'h01000/2);
+        settle();                               // let the prefetch run
+        t_read('h01008, d, c2);                 // the NEXT line along
+        chk("the next line arrived without being asked for", c2, 3);
+        chkh("...and its data is right", d, 16'h1000 + 'h01008/2);
+
+        // It must not chain. Prefetching off a prefetch would run ahead of
+        // the program and evict lines that were actually wanted.
+        settle();
+        t_read('h01010, d, c2);                 // two lines on
+        checks++;
+        if (c2 <= 3) begin
+            $display("FAIL prefetch chained past the line after the miss");
+            errors++;
+        end
+
+        // ---- a demand access must never wait for a prefetch ----
+        // THE POINT OF THE WHOLE DESIGN. The memory path is blocking, so a
+        // prefetch holding the port while the CPU wants it would make the
+        // machine slower rather than faster.
+        //
+        // The wait for is_pf is what makes this test mean anything. An
+        // earlier version just issued two reads back to back and measured 26
+        // cycles against 10 -- but that delay was the PREVIOUS demand fill
+        // still finishing in the background, which critical-word-first does
+        // by design and has nothing to do with prefetching. Waiting until a
+        // prefetch is genuinely in flight is the only way to attribute the
+        // delay to the right thing.
+        flush('h000000);
+        settle();
+        t_read('h02000, d, miss_cycles);        // reference: a plain miss
+        settle();
+
+        flush('h000000);
+        settle();
+        t_read('h03000, d, c2);                 // miss; queues a prefetch
+        i = 0;
+        while (!dut.is_pf && i < 400) begin @(negedge clk); i++; end
+        checks++;
+        if (!dut.is_pf) begin
+            $display("FAIL no prefetch was ever started after a miss");
+            errors++;
+        end
+        repeat (3) @(negedge clk);              // land inside the fill
+        t_read('h05000, d, c2);                 // demand, mid-prefetch
+        chkh("the demand read got its own data", d, 16'h1000 + 'h05000/2);
+        checks++;
+        if (c2 > miss_cycles + LAT + 6) begin
+            $display("FAIL a demand read waited for a prefetch: %0d vs %0d",
+                     c2, miss_cycles);
+            errors++;
+        end
+        checks++;
+        if (pf_aborts == 0) begin
+            $display("FAIL the prefetch was not abandoned for the demand");
+            errors++;
+        end
+
+        // An abandoned prefetch must not leave a half-filled line valid.
+        settle();
+        t_read('h03008, d, c2);
+        chkh("an abandoned line is refetched correctly", d,
+             16'h1000 + 'h03008/2);
+
+        // ---- a prefetch must not corrupt the line it displaces ----
+        // The cache is direct mapped, so a prefetched line shares its index
+        // with whatever is already resident there, and the fill writes into
+        // the data array straight away. If the displaced line is not
+        // invalidated first, its tag and valid bit still claim it is good
+        // while its data has been overwritten -- and the cache serves the
+        // corruption as a hit. Addresses 2 KB apart share an index here.
+        flush('h000000);
+        settle();
+        // 6000 and 6800 are 2 KB apart so they share an index, and neither
+        // has been written by an earlier case -- 4000 has, which is how the
+        // first version of this check came to expect the wrong value.
+        t_fill('h06000);                        // resident at index 0
+        t_read('h06000, d, c2);
+        chk("the line is resident before the prefetch", c2, 3);
+
+        // A miss whose NEXT line lands on the same index with a different tag.
+        t_read('h067F8, d, c2);
+        settle();                               // let the prefetch complete
+
+        t_read('h06000, d, c2);
+        chkh("the displaced line is not served corrupted", d,
+             16'h1000 + 'h06000/2);
+
+        // ...and the case that actually reaches the bug: read the displaced
+        // line WHILE the prefetch is filling over it. The fill writes the
+        // data array immediately but only fixes the tag at the end, so in
+        // between the line still claims to be the old one. Aborting there
+        // and serving the read gives a hit on a line whose data has been
+        // half replaced. Completing the prefetch first hides this, which is
+        // why the check above passes either way.
+        flush('h000000);
+        settle();
+        t_fill('h06000);
+        t_read('h067F8, d, c2);                 // queues a prefetch of 6800
+        i = 0;
+        while (!dut.is_pf && i < 400) begin @(negedge clk); i++; end
+        repeat (4) @(negedge clk);              // let it write a word or two
+        t_read('h06000, d, c2);                 // the displaced line
+        chkh("no corrupt hit on a line a prefetch was overwriting", d,
+             16'h1000 + 'h06000/2);
+
+        // ---- a prefetch must never answer the CPU ----
+        // fill_ack forwards the first word of a fill straight to the CPU and
+        // asserts c_ready. That is the critical-word-first path and it is
+        // right for a demand miss. For a prefetch nobody asked for the word,
+        // so firing it hands a waiting read data from an address it never
+        // requested -- and the machine then executes whatever was
+        // prefetched. Every other check in this file passed while that was
+        // broken; only booting DOS caught it.
+        //
+        // The read is issued as early as possible after the prefetch starts,
+        // so it is still waiting when the prefetch's FIRST word lands.
+        flush('h000000);
+        settle();
+        t_read('h07000, d, c2);                 // miss; queues a prefetch
+        i = 0;
+        while (!dut.is_pf && i < 400) begin @(negedge clk); i++; end
+        t_read('h0A000, d, c2);                 // unrelated address, at once
+        chkh("a waiting read is not answered with prefetch data", d,
+             16'h1000 + 'h0A000/2);
 
         // ---- the counters ----
         checks++;
